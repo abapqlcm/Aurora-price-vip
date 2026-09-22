@@ -51,10 +51,11 @@ def _fa(text: str) -> str:
 _RAQM = None  # کش وضعیت libraqm
 
 def _rtl(s: str) -> str:
-    """متن فارسی برای PIL:
-    - با libraqm: خام بده (raqm خودش RTL + اتصال حروف رو انجام می‌ده)
-    - بدون libraqm (Railway): reshape + bidi
-    """
+    """متن فارسی برای PIL — idempotent و قطعی (همه‌جا یک جواب):
+    - اگر raqm فعال است: متن خام بده (raqm خودش RTL می‌کند) — فقط یک بار
+    - اگر raqm نیست: reshape + bidi — فقط یک بار
+    محافظ anti-double-process: اگر متن قبلاً reshape شده (حروف presentation forms
+    در بازهٔ FB50–FEFF)، دیگر دست نمی‌خورد — جلوی برعکس‌شدن متن گرفته می‌شه."""
     global _RAQM
     if _RAQM is None:
         try:
@@ -63,6 +64,9 @@ def _rtl(s: str) -> str:
             _RAQM = False
     s = str(s)
     if _RAQM:
+        return s
+    # anti-double-process: presentation forms یعنی قبلاً reshape شده
+    if any("\uFB50" <= ch <= "\uFEFF" for ch in s):
         return s
     try:
         return get_display(arabic_reshaper.reshape(s))
@@ -1014,6 +1018,10 @@ def _render_banner_uncached(code: str, ck: str, now: float, no_chart: bool = Fal
 
     price = data["price"]
     pct = data.get("change_pct")
+    if not data.get("updated"):
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        ir = _tz(_td(hours=3, minutes=30))
+        data["updated"] = _dt.now(ir).strftime("%H:%M:%S")
     hist = data.get("history") or []
     # ارزهای er-api تاریخچه ندارن → خط تخت زنده بساز (از snapshotهای ربات)
     if len(hist) < 2 and price:
@@ -1109,10 +1117,10 @@ def _render_banner_uncached(code: str, ck: str, now: float, no_chart: bool = Fal
     card.alpha_composite(glow_layer)
 
     y = 36
-    # --- عنوان + پرچم + بج LIVE ---
+    # --- عنوان + پرچم + بج LIVE --- (عنوان بنر همیشه EN — مقاوم به RTL/raqm)
     f_title = _font(44, "b")
-    title = data["name"]
-    cd.text((cw - 36, y), _rtl(_fa(title)), font=f_title, fill=WHITE, anchor="ra")
+    title = catalog.display_en(code)
+    cd.text((cw - 36, y), title, font=f_title, fill=WHITE, anchor="ra")
     # ۲۰. بج LIVE گوشه‌ی چپ بالا (کنار آیکون)
     if not no_chart:
         _draw_live_badge(cd, 28 + 84 + 14, y + 24)
@@ -1173,17 +1181,17 @@ def _render_banner_uncached(code: str, ck: str, now: float, no_chart: bool = Fal
     unit = data["unit"]
     if not omit_price:
         price_txt = f"{_fmt(price)} {unit if unit=='دلار' else ''}".strip()
-        cd.text((cw // 2, y + 56), _rtl(_fa(price_txt)), font=f_price, fill=GOLD_BRIGHT, anchor="mm")
+        cd.text((cw // 2, y + 56), price_txt, font=f_price, fill=GOLD_BRIGHT, anchor="mm")
         if unit == "تومان":
-            # ۹. واحد تو چیپ جدا
-            chip_txt = "تومان"
+            # ۹. واحد تو چیپ جدا (EN — مقاوم به RTL)
+            chip_txt = "TOMAN"
             f_chip = _font(28, "b")
-            chw = cd.textlength(_rtl(_fa(chip_txt)), font=f_chip)
+            chw = cd.textlength(chip_txt, font=f_chip)
             cx1 = cw // 2 - chw / 2 - 24
             cx2 = cw // 2 + chw / 2 + 24
             cd.rounded_rectangle((cx1, y + 122, cx2, y + 122 + 46), radius=23,
                                  fill=(255, 255, 255, 24), outline=GRAY + (120,), width=1)
-            cd.text((cw // 2, y + 122 + 23), _rtl(_fa(chip_txt)), font=f_chip, fill=GRAY, anchor="mm")
+            cd.text((cw // 2, y + 122 + 23), chip_txt, font=f_chip, fill=GRAY, anchor="mm")
     y += 190
 
     # بازه خرید/فروش صرافی
@@ -1204,14 +1212,14 @@ def _render_banner_uncached(code: str, ck: str, now: float, no_chart: bool = Fal
         up = pct >= 0
         color = GREEN if up else RED
         sign = "+" if up else ""
-        label = f"{sign}{pct:.2f}٪  ۲۴س"
+        label = f"{sign}{pct:.2f}%  24H"
         f_chg = _font(30, "b")
-        tw = cd.textlength(_rtl(_fa(label)), font=f_chg)
+        tw = cd.textlength(label, font=f_chg)
         bx1 = cw // 2 - tw / 2 - 28
         bx2 = cw // 2 + tw / 2 + 28
         cd.rounded_rectangle((bx1, y, bx2, y + 56), radius=28, fill=color + (46,),
                              outline=color + (220,), width=2)
-        cd.text((cw // 2, y + 28), _rtl(_fa(label)), font=f_chg, fill=color, anchor="mm")
+        cd.text((cw // 2, y + 28), label, font=f_chg, fill=color, anchor="mm")
         y += 84
 
     # ۸. جداکننده‌ی شمش طلایی (فقط طلا) بین چیپ و نمودار
@@ -1231,13 +1239,13 @@ def _render_banner_uncached(code: str, ck: str, now: float, no_chart: bool = Fal
         chart = _area_chart(hist, cw - 56, chart_h, up, ohlcv=ohlcv_data, candlestick=candlestick)
         card.paste(chart, (28, y), chart)
         y += chart_h + 20
-        # کپشن نمودار + تاریخ آخرین آپدیت قیمت
+        # کپشن نمودار + تاریخ آخرین آپدیت قیمت (EN — مقاوم به RTL)
         f_cap = _font(22, "r")
         if unit == "تومان":
-            cap = "روند ۱۴ روز گذشته · آخرین بروزرسانی: " + data.get("updated", "")
+            cap = "14-day trend · updated: " + data.get("updated", "")
         else:
-            cap = "روند ۷ روز گذشته (ساعتی) · زنده"
-        cd.text((cw // 2, y), _rtl(_fa(cap)), font=f_cap, fill=GRAY, anchor="mm")
+            cap = "24h trend (hourly) · live"
+        cd.text((cw // 2, y), cap, font=f_cap, fill=GRAY, anchor="mm")
         y += 48
 
     # 🔷 لوگوی بزرگ تون — وسط کارت، روی نمودار (شفاف، خفن)
@@ -1256,7 +1264,7 @@ def _render_banner_uncached(code: str, ck: str, now: float, no_chart: bool = Fal
     if h24 and l24 and h24 > l24 and not no_chart:
         _draw_24h_range_bar(cd, 40, cw - 40, y, l24, h24, price, card_outline)
         f_rl = _font(20, "b")
-        cd.text((cw // 2, y + 52), _rtl(_fa("موقعیت قیمت در بازه ۲۴ ساعت")),
+        cd.text((cw // 2, y + 52), "Price position in 24h range",
                 font=f_rl, fill=GRAY, anchor="mm")
         y += 84
 

@@ -255,16 +255,20 @@ KNOWN_CODES = set(FA_TO_KEY.values())
 def render_price_card(rows, title="", subtitle=""):
     """کارت ساده‌ی چندردیفه — برای «همه» و «کریپتو»."""
     def _rtl_f(s):
-        """RTL: با libraqm خام، بدون libraqm reshape+bidi."""
+        """RTL idempotent: anti-double-process (متن reshape‌شده دوباره پردازش نمی‌شه)."""
+        s = str(s)
         try:
             if features.check("raqm"):
-                return str(s)
+                return s
         except Exception:
             pass
+        # presentation forms = قبلاً reshape شده → دست نزن
+        if any("\uFB50" <= ch <= "\uFEFF" for ch in s):
+            return s
         try:
-            return get_display(arabic_reshaper.reshape(str(s)))
+            return get_display(arabic_reshaper.reshape(s))
         except Exception:
-            return str(s)
+            return s
 
     W = 720
     row_h = 64

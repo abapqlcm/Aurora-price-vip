@@ -181,3 +181,49 @@ def asset_urls(code: str):
     if code in STABLE:
         return "https://raw.githubusercontent.com/spothq/cryptocurrency-icons/master/128/color/usdt.png", "crypto", "usdt"
     return None, None, None
+
+
+# نمایش EN روی بنر — عنوان‌های بنر همیشه انگلیسی (مقاوم به RTL/raqm)
+DISPLAY_EN = {
+    # فیات
+    "dollar": "DOLLAR", "euro": "EURO", "pound": "POUND", "aed": "AED",
+    "try": "TRY", "chf": "CHF", "cad": "CAD", "aud": "AUD", "cny": "CNY",
+    "jpy": "JPY", "rub": "RUB", "kwd": "KWD", "sar": "SAR", "omr": "OMR",
+    "qar": "QAR", "bhd": "BHD", "inr": "INR", "pkr": "PKR", "myr": "MYR",
+    "iqd": "IQD", "sek": "SEK", "nok": "NOK", "dkk": "DKK", "afn": "AFN",
+    "krw": "KRW", "thb": "THB", "brl": "BRL", "mxn": "MXN", "zar": "ZAR",
+    "sgd": "SGD", "hkd": "HKD", "nzd": "NZD", "ils": "ILS", "pln": "PLN",
+    "czk": "CZK", "huf": "HUF", "ron": "RON", "azn": "AZN", "amd": "AMD",
+    "gel": "GEL", "kzt": "KZT", "uzs": "UZS", "etb": "ETB", "ngn": "NGN",
+    "egp": "EGP", "lyd": "LYD", "jod": "JOD", "lbp": "LBP", "syp": "SYP",
+    "yer": "YER", "mad": "MAD", "dzd": "DZD", "tnd": "TND", "sdp": "SDP",
+    "lkr": "LKR", "bdt": "BDT", "mmk": "MMK", "vnd": "VND", "php": "PHP",
+    "idr": "IDR", "uyu": "UYU", "ars": "ARS", "clp": "CLP", "cop": "COP",
+    "pen": "PEN",
+    # طلا / سکه
+    "gold_18": "GOLD 18K", "gold_24": "GOLD 24K", "coin_emami": "EMAMI COIN",
+    "coin_bahar": "BAHAR COIN", "coin_half": "HALF COIN",
+    "coin_quarter": "QUARTER COIN", "coin_gerami": "GERAMI COIN",
+    "gold_melted": "GOLD MELTED",
+    # استیبل
+    "usdt": "USDT",
+    # کریپتو (نمادها خودشان EN هستند)
+    "BTC": "BITCOIN", "ETH": "ETHEREUM", "BNB": "BNB", "SOL": "SOLANA",
+    "XRP": "XRP", "ADA": "CARDANO", "DOGE": "DOGE", "TRX": "TRON",
+    "SHIB": "SHIBA", "DOT": "POLKADOT", "LTC": "LITECOIN", "AVAX": "AVALANCHE",
+    "LINK": "CHAINLINK", "MATIC": "POLYGON", "ATOM": "COSMOS", "NEAR": "NEAR",
+    "XLM": "STELLAR", "BCH": "BITCOIN CASH", "FIL": "FILECOIN", "UNI": "UNISWAP",
+    "ETC": "ETC", "ARB": "ARBITRUM", "OP": "OPTIMISM", "PEPE": "PEPE",
+    "SAND": "SANDBOX", "MANA": "MANA", "AXS": "AXIE", "APT": "APTOS",
+    "TON": "TONCOIN",
+}
+
+
+def display_en(code: str) -> str:
+    """عنوان EN برای بنر — fallback: کد خودش."""
+    std = resolve(code) or code
+    if std in DISPLAY_EN:
+        return DISPLAY_EN[std]
+    if std in CRYPTO:
+        return std
+    return str(std).upper()
