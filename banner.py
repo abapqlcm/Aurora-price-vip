@@ -317,7 +317,7 @@ def render_banner_video(code: str, duration: float = 3.0, fps: int = 24) -> Opti
     ck = catalog.resolve(code) or code
     now = time.time()
     hit = _MP4_CACHE.get(ck)
-    if hit and now - hit[0] < 25:
+    if hit and now - hit[0] < 60:
         val = hit[1]
         if val is None:
             del _MP4_CACHE[ck]
@@ -326,7 +326,7 @@ def render_banner_video(code: str, duration: float = 3.0, fps: int = 24) -> Opti
     with _VIDEO_LOCK:
         hit = _MP4_CACHE.get(ck)
         now = time.time()
-        if hit and now - hit[0] < 25:
+        if hit and now - hit[0] < 60:
             return hit[1]
         try:
             # Fetch data once, pass to renderer (avoids duplicate HTTP call)
@@ -411,22 +411,30 @@ def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps:
         try:
             n_frames = int(duration * fps)
             pf = _ember_price_font(price)
+            # بهینه‌سازی سرعت (۲۰۲۶-۱۱-۲۵): هاله‌ی خورشید در ۸ سطحِ تنفس از پیش داخل
+            # پایه پخته می‌شود تا هر فریم کامپوزیت تمام‌صفحه نخواهد
+            _bases = []
+            for _k in range(8):
+                _ga = glow.copy()
+                _av = 0.10 + 0.05 * (-1 + 2 * _k / 7)
+                _ga.putalpha(_ga.split()[3].point(lambda v: int(v * _av)))
+                _bases.append(Image.alpha_composite(base_img.convert("RGBA"), _ga))
             for f in range(n_frames):
                 t = f / max(1, n_frames - 1)
                 tsec = f / fps
-                img = base_img.convert("RGBA")
-                # هاله‌ی خورشید — تنفس آرام
-                ga = glow.copy()
-                ga.putalpha(ga.split()[3].point(lambda v: int(v * (0.10 + 0.05 * math.sin(tsec * math.pi * 2 * 0.57)))))
-                img = Image.alpha_composite(img, ga)
+                _ph = math.sin(tsec * math.pi * 2 * 0.57)
+                img = _bases[int((_ph + 1) / 2 * 7.99)].copy()
                 # پیشرفت اصلی — یک محرک واحد برای قیمت + نمودار + نوار بازه (هم‌زمان، بدون عقب‌جلو)
                 mp = _ember_ease_io(_ember_clamp01((t - 0.06) / 0.56))
                 # قیمت — شمارش از صفر تا قیمت نهایی با گرادیان کهربایی
                 pv = price if t >= 0.64 else price * mp
                 pv_show = int(pv) if price >= 100 else pv
-                tm = Image.new("L", (W, H), 0)
-                ImageDraw.Draw(tm).text((84, 266), _fmt(pv_show), font=pf, fill=255)
-                img = Image.alpha_composite(img, Image.composite(grad, Image.new("RGBA", (W, H), (0, 0, 0, 0)), tm))
+                # کامپوزیت فقط روی نوار قیمت (نه تمام صفحه) — سریع‌تر
+                _band = (40, 230, 880, 430)
+                tm = Image.new("L", (_band[2] - _band[0], _band[3] - _band[1]), 0)
+                ImageDraw.Draw(tm).text((84 - _band[0], 266 - _band[1]), _fmt(pv_show), font=pf, fill=255)
+                _comp = Image.composite(grad.crop(_band), Image.new("RGBA", tm.size, (0, 0, 0, 0)), tm)
+                img.paste(_comp, (_band[0], _band[1]), _comp)
                 d = ImageDraw.Draw(img, "RGBA")
                 # نمودار — کشیده‌شدن هم‌زمان با قیمت
                 if mp > 0:
@@ -434,6 +442,7 @@ def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps:
                     pts = sm[:n]
                     fa = int(46 * _ember_clamp01((t - 0.22) / 0.34))
                     if fa > 0:
+                        # پرکردن نیمه‌شفاف فقط با لایه+کامپوزیت درست blend می‌شود (Pillow 10.4)
                         fl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
                         ImageDraw.Draw(fl).polygon(pts + [(pts[-1][0], cy1), (cx0, cy1)], fill=(255, 154, 60, fa))
                         img = Image.alpha_composite(img, fl)
@@ -454,7 +463,7 @@ def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps:
                 if cp > 0 and chip_layer is not None:
                     ch = chip_layer.copy()
                     ch.putalpha(ch.split()[3].point(lambda v: int(v * cp)))
-                    img.alpha_composite(ch, (0, int((1 - cp) * 10)))
+                    img.paste(ch, (0, int((1 - cp) * 10)), ch)
                     d = ImageDraw.Draw(img, "RGBA")
                 # بج LIVE — چشمک واقعی روشن/خاموش (دوره‌ی ۱٫۲ ثانیه)
                 cyc = (tsec % 1.2) / 1.2
@@ -466,7 +475,7 @@ def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps:
                           outline=_lc((96, 58, 26), (255, 170, 90), bright * (1 - cyc)), width=2)
                 d.ellipse((715 - 9, 110 - 9, 715 + 9, 110 + 9), fill=_lc((70, 42, 20), (150, 92, 40), bright))
                 d.ellipse((715 - 6, 110 - 6, 715 + 6, 110 + 6), fill=_lc((120, 70, 28), (255, 199, 116), bright))
-                # ذرات جرقه‌ی شناور
+                # ذرات جرقه‌ی شناور — لایه + کامپوزیت (blend درست آلفا)
                 pov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
                 pd = ImageDraw.Draw(pov)
                 for p in _EMBER_PARTS:
@@ -981,15 +990,15 @@ def render_banner(code: str) -> Optional[bytes]:
     ck = catalog.resolve(code) or code
     hit = _PNG_CACHE.get(ck)
     now = time.time()
-    # کش ۵ ثانیه — هماهنگ با دیتای لایو ۳ ثانیه
-    if hit and now - hit[0] < 5:
+    # کش ۲۰ ثانیه — تعادل تازگی/سرعت (رندر تکراری کمتر، صف کوتاه‌تر)
+    if hit and now - hit[0] < 20:
         return hit[1]
 
     # ۱۳. فقط یه thread در آن واحد رندر کنه (double-check بعد از lock)
     with _RENDER_LOCK:
         hit = _PNG_CACHE.get(ck)
         now = time.time()
-        if hit and now - hit[0] < 5:
+        if hit and now - hit[0] < 20:
             return hit[1]
         return _render_banner_uncached(code, ck, now)
 
