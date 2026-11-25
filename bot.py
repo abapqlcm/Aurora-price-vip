@@ -8,6 +8,7 @@ import logging
 import time
 import threading
 import asyncio
+import html
 import socket
 import ssl
 import subprocess
@@ -578,6 +579,16 @@ def _admin_main_kb():
     ])
 
 
+def _rel_seen(t: float) -> str:
+    """آخرین فعالیت به‌صورت نسبی — Xm/Xh/Xd."""
+    d = max(0, int(time.time() - (t or 0)))
+    if d < 3600:
+        return f"{max(1, d // 60)}m"
+    if d < 86400:
+        return f"{d // 3600}h"
+    return f"{d // 86400}d"
+
+
 async def on_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/admin — داشبورد اصلی."""
     if not _is_owner(update):
@@ -595,6 +606,32 @@ async def on_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🕐 <i>{render._now_en()}</i>"
     )
     await update.message.reply_text(txt, parse_mode="HTML", reply_markup=_admin_main_kb())
+
+
+def _bot_sync(loop, coro, timeout: float = 30.0):
+    """اجرای coroutine تلگرام (متدهای async Bot) از داخل executor — بدون بلاک شدن event loop اصلی."""
+    return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=timeout)
+
+
+def _grp_live_info(ctx, cid: int) -> dict:
+    """اطلاعات زنده‌ی گروه — get_chat + get_chat_member_count در یک call executor."""
+    loop = asyncio.get_running_loop()
+    # هر دو call تلگرام تو executor — event loop اصلی بلاک نشه (مثل adm_health)
+    chat = _bot_sync(loop, ctx.bot.get_chat(cid))
+    try:
+        mc = _bot_sync(loop, ctx.bot.get_chat_member_count(cid))
+    except Exception:
+        mc = None
+    return {"title": getattr(chat, "title", None), "username": getattr(chat, "username", None),
+            "member_count": mc}
+
+
+def _safe_answer(query, text: str, alert: bool = False) -> None:
+    """answer دوم روی همون CallbackQuery تو تلگرام خطا می‌ده — بی‌صدا رد می‌شیم."""
+    try:
+        asyncio.get_running_loop().create_task(query.answer(text, show_alert=alert))
+    except Exception:
+        pass
 
 
 async def _admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query, data: str):
@@ -628,6 +665,163 @@ async def _admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query, data:
             lines.append("هنوز گروهی ثبت نشده.")
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ برگشت", callback_data="adm_main")]])
         await query.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+
+    elif data == "adm_groups":
+        # ورودی دکمه‌ی اصلی پنل → همون لیست صفحه‌بندی‌شده (صفحه‌ی ۰)
+        await _admin_cb(update, ctx, query, "adm_grpp:0")
+
+    elif data.startswith("adm_grpp:"):
+        # لیست صفحه‌بندی‌شده‌ی گروه‌ها (۵ تا در هر صفحه)
+        try:
+            page = int(data.split(":", 1)[1])
+        except Exception:
+            page = 0
+        chunk, total, has_more = admin.groups_page(page, 5)
+        lines = [f"👨‍👩‍👧‍👦 <b>گروه‌ها ({total}):</b>\n"]
+        for cid, g in chunk:
+            title = html.escape(g.get("title") or "بی‌نام")
+            # لینک: t.me/@username یا لینک دعوت ذخیره‌شده
+            if g.get("username"):
+                title = f'<a href="https://t.me/{html.escape(str(g["username"]))}">{title}</a>'
+            elif g.get("invite_link"):
+                title = f'<a href="{html.escape(str(g["invite_link"]))}">🔗 {title}</a>'
+            last = g.get("last", 0)
+            em = "🟢" if time.time() - last < 3600 else ("🟡" if time.time() - last < 86400 else "⚪")
+            lines.append(f"{em} {title} — {g.get('count', 0)} پیام — {html.escape(_rel_seen(last))}")
+            # یادداشت صفحه برای برگشت از جزئیات
+            with _GRP_PAGE_LOCK:
+                _GRP_PAGE[int(cid)] = page
+        if not chunk:
+            lines.append("هنوز گروهی ثبت نشده.")
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️", callback_data=f"adm_grpp:{page - 1}"))
+        if has_more:
+            nav.append(InlineKeyboardButton("▶️", callback_data=f"adm_grpp:{page + 1}"))
+        rows = []
+        # دکمه‌ی 👁 برای هر گروه → جزئیات
+        for cid, _g in chunk:
+            rows.append([InlineKeyboardButton("👁", callback_data=f"adm_grp:{cid}")])
+        if nav:
+            rows.append(nav)
+        rows.append([InlineKeyboardButton("◀️ برگشت", callback_data="adm_main")])
+        await query.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+    elif data.startswith("adm_grp:"):
+        # جزئیات یک گروه + تلاش برای اطلاعات زنده (get_chat + member_count در یک executor)
+        try:
+            cid = int(data.split(":", 1)[1])
+        except Exception:
+            _safe_answer(query, "⛔ شناسه‌ی گروه نامعتبره", show_alert=True)
+            return
+        g = admin.group_get(cid) or {"title": "بی‌نام"}
+        title = html.escape(str(g.get("title") or "بی‌نام"))
+        un = g.get("username")
+        first = html.escape(_rel_seen(g.get("first", 0)))
+        last = html.escape(_rel_seen(g.get("last", 0)))
+        live = ""
+        loop = asyncio.get_running_loop()
+        try:
+            # یک lambda واحد — هر دو call شبکه‌ای تو thread جدا از event loop
+            info = await loop.run_in_executor(None, lambda: _grp_live_info(ctx, cid))
+            mc = info.get("member_count")
+            live = f"\n👥 اعضا: <b>{mc}</b>" if mc is not None else ""
+            if info.get("title"):
+                title = html.escape(str(info["title"]))
+            if info.get("username"):
+                un = info["username"]
+        except Exception:
+            live = "\nℹ️ برای اطلاعات زنده، ربات باید در گروه ادمین باشد"
+        lnk = f'<a href="https://t.me/{html.escape(str(un))}">@{html.escape(str(un))}</a>' if un else "—"
+        typ = html.escape(str(g.get("type") or "؟"))
+        txt = (
+            f"👨‍👩‍👧‍👦 <b>{title}</b>\n\n"
+            f"🆔 <code>{cid}</code>\n"
+            f"📌 نوع: <b>{typ}</b>\n"
+            f"🔗 لینک: {lnk}\n"
+            f"💬 پیام‌ها: <b>{g.get('count', 0)}</b>\n"
+            f"🕐 اولین فعالیت: <b>{first}</b> — آخرین: <b>{last}</b>"
+            f"{live}"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔗 لینک جدید", callback_data=f"adm_grplink:{cid}"),
+             InlineKeyboardButton("📢 پیام به این گروه", callback_data=f"adm_grpbcast:{cid}")],
+            [InlineKeyboardButton("🚪 خروج از گروه", callback_data=f"adm_grpleave:{cid}")],
+            [InlineKeyboardButton("◀️ برگشت", callback_data=f"adm_grpp:{_GRP_PAGE.get(cid, 0)}")],
+        ])
+        await query.edit_message_text(txt, parse_mode="HTML", reply_markup=kb)
+
+    elif data.startswith("adm_grplink:"):
+        # گرفتن invite_link تازه — ربات باید ادمین گروه باشه
+        try:
+            cid = int(data.split(":", 1)[1])
+        except Exception:
+            _safe_answer(query, "⛔ شناسه‌ی گروه نامعتبره", show_alert=True)
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            link = await loop.run_in_executor(
+                None, lambda: _bot_sync(loop, ctx.bot.export_chat_invite_link(cid)))
+        except Exception:
+            _safe_answer(query, "⛔ ربات ادمین این گروه نیست", show_alert=True)
+            return
+        admin.group_set_link(cid, link)
+        _safe_answer(query, "✅ لینک جدید ذخیره شد")
+        # رندر دوباره‌ی جزئیات — خودمون query.data رو شبیه‌سازی می‌کنیم
+        await _admin_cb(update, ctx, query, f"adm_grp:{cid}")
+
+    elif data.startswith("adm_grpbcast:"):
+        # broadcast تک‌گروهی — متن بعدی فقط به همین گروه می‌ره
+        try:
+            cid = int(data.split(":", 1)[1])
+        except Exception:
+            _safe_answer(query, "⛔ شناسه‌ی گروه نامعتبره", show_alert=True)
+            return
+        with _BC_TARGETS_LOCK:
+            _BC_TARGETS[admin.OWNER_ID] = [cid]
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ انصراف", callback_data="adm_cancel_bc")]])
+        await query.edit_message_text(
+            "📢 <b>پیام به این گروه</b>\n\nمتن پیام رو بفرست (همون پیام به این گروه می‌ره).\n"
+            "برای انصراف دکمه‌ی زیر یا /cancel_bc.",
+            parse_mode="HTML", reply_markup=kb)
+
+    elif data.startswith("adm_grpleave:"):
+        # تأییدیه‌ی خروج از گروه
+        try:
+            cid = int(data.split(":", 1)[1])
+        except Exception:
+            _safe_answer(query, "⛔ شناسه‌ی گروه نامعتبره", show_alert=True)
+            return
+        g = admin.group_get(cid) or {}
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ مطمئنم", callback_data=f"adm_grpleaveok:{cid}"),
+             InlineKeyboardButton("❌ انصراف", callback_data=f"adm_grp:{cid}")],
+            [InlineKeyboardButton("◀️ برگشت", callback_data=f"adm_grpp:{_GRP_PAGE.get(cid, 0)}")],
+        ])
+        await query.edit_message_text(
+            f"🚪 از «<b>{html.escape(str(g.get('title') or 'بی‌نام'))}</b>» خارج بشم؟",
+            parse_mode="HTML", reply_markup=kb)
+
+    elif data.startswith("adm_grpleaveok:"):
+        # خروج واقعی — leave_chat در executor، بعد حذف از آمار و رندر لیست
+        try:
+            cid = int(data.split(":", 1)[1])
+        except Exception:
+            _safe_answer(query, "⛔ شناسه‌ی گروه نامعتبره", show_alert=True)
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(None, lambda: _bot_sync(loop, ctx.bot.leave_chat(cid)))
+        except Exception as e:
+            log.error("leave_chat %s: %s", cid, e)
+            _safe_answer(query, "⚠️ خروج ناموفق — ربات ادمین گروه نیست یا دسترسی نداره", show_alert=True)
+            return
+        admin.group_remove(cid)
+        page = _GRP_PAGE.get(cid, 0)
+        with _GRP_PAGE_LOCK:
+            _GRP_PAGE.pop(cid, None)
+        _safe_answer(query, "🚪 خارج شد")
+        await _admin_cb(update, ctx, query, f"adm_grpp:{page}")
 
     elif data == "adm_chart":
         s = admin.overview()
@@ -696,11 +890,19 @@ async def _admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query, data:
     elif data == "adm_cancel_bc":
         with _BC_STATE_LOCK:
             _BC_STATE.pop(admin.OWNER_ID, None)
+        with _BC_TARGETS_LOCK:
+            _BC_TARGETS.pop(admin.OWNER_ID, None)  # هدف تک‌گروهی هم با لغو پاک می‌شه
         await query.edit_message_text("✅ ارسال همگانی لغو شد.", reply_markup=_admin_main_kb())
 
 
 _BC_STATE: dict = {}
 _BC_STATE_LOCK = threading.Lock()
+# هدف broadcast — اگه ست باشه، متن بعدی فقط به همین چت‌ها می‌ره (broadcast تک‌گروهی)
+_BC_TARGETS: dict = {}
+_BC_TARGETS_LOCK = threading.Lock()
+# صفحه‌ی فعلی لیست گروه‌ها برای هر cid — تا «برگشت» از جزئیات به همون صفحه برگرده
+_GRP_PAGE: dict = {}
+_GRP_PAGE_LOCK = threading.Lock()
 _BOOT_TIME = time.time()
 
 
@@ -722,7 +924,7 @@ async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_broadcast_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """اگه ادمین تو حالت broadcast هست، متن = پیام همگانی."""
+    """اگه ادمین تو حالت broadcast هست، متن = پیام همگانی (یا تک‌گروهی اگه _BC_TARGETS ست باشه)."""
     uid = update.effective_user.id
     with _BC_STATE_LOCK:
         if not _BC_STATE.get(uid):
@@ -730,9 +932,12 @@ async def on_broadcast_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # state تا آخر حلقه نگه داشته می‌شه — هر دور با فعال بودنش چک می‌شه (قابل لغو وسط کار)
     owner_id = uid  # قبل از حلقه ذخیره بشه — متغیر uid تو حلقه روی id هر کاربر overrule می‌شه
     msg = update.message
-    targets = admin.all_user_ids()
+    with _BC_TARGETS_LOCK:
+        targets = _BC_TARGETS.get(owner_id)  # اگه ست باشه → فقط همین چت‌ها، وگرنه همه‌ی کاربران
+    if not targets:
+        targets = admin.all_user_ids()
     ok = fail = 0
-    status = await msg.reply_text(f"📢 در حال ارسال به {len(targets)} کاربر...")
+    status = await msg.reply_text(f"📢 در حال ارسال به {len(targets)} چت...")
     for uid in targets:
         # 🛑 لغو وسط کار: اگه ادمین /cancel_bc زده باشه یا «انصراف»، state خالی می‌شه → حلقه می‌ایسته
         with _BC_STATE_LOCK:
@@ -746,6 +951,8 @@ async def on_broadcast_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(0.05)  # rate-limit
     with _BC_STATE_LOCK:
         _BC_STATE.pop(owner_id, None)
+    with _BC_TARGETS_LOCK:
+        _BC_TARGETS.pop(owner_id, None)  # هدف تک‌گروهی همیشه بعد از اتمام پاک می‌شه
     await status.edit_text(f"📢 تمام شد!\n✅ موفق: {ok}\n❌ ناموفق: {fail}")
     return True
 
@@ -756,6 +963,8 @@ async def on_cancel_bc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if user:
         with _BC_STATE_LOCK:
             _BC_STATE.pop(user.id, None)
+        with _BC_TARGETS_LOCK:
+            _BC_TARGETS.pop(user.id, None)  # هدف تک‌گروهی هم با لغو پاک می‌شه
     try:
         await update.message.reply_text("✅ ارسال همگانی لغو شد.")
     except Exception:

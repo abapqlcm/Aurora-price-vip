@@ -129,7 +129,8 @@ def track_user(user) -> dict:
     return u
 
 def track_group(chat) -> None:
-    """ثبت گروه/سوپرگروه که ربات توش فعال شده."""
+    """ثبت گروه/سوپرگروه که ربات توش فعال شده — با فیلدهای پنل جدید: username/invite_link/type/member_count.
+    فقط چیزی که خود Update داره ذخیره می‌شه؛ هیچ call شبکه‌ای اینجا انجام نمی‌شه."""
     if chat is None or chat.type not in ("group", "supergroup"):
         return
     cid = str(chat.id)
@@ -139,6 +140,13 @@ def track_group(chat) -> None:
         g["title"] = chat.title or ""
         g["last"] = now
         g["count"] = g.get("count", 0) + 1
+        # فیلدهای اختیاری پنل — با getattr پیش‌فرض None تا آبجکت‌های ناقص هم کرش ندن
+        g["username"] = getattr(chat, "username", None)
+        g["invite_link"] = getattr(chat, "invite_link", None)
+        g["type"] = chat.type
+        mc = getattr(chat, "member_count", None)
+        if mc is not None:
+            g["member_count"] = mc
         _groups[cid] = g
         _save_debounced()
 
@@ -185,6 +193,37 @@ def users_list(page: int = 0, per: int = 10):
 def groups_list():
     with _lock:
         return sorted(_groups.items(), key=lambda kv: -kv[1].get("count", 0))
+
+def group_get(cid) -> dict | None:
+    """یک entry گروه برای نمایش پنل (کپی — تا caller دستکاریش ذخیره نشه)."""
+    with _lock:
+        g = _groups.get(str(cid))
+        return dict(g) if g else None
+
+def groups_page(page: int = 0, per: int = 10):
+    """صفحه‌بندی گروه‌ها مثل users_list — مرتب بر اساس آخرین فعالیت."""
+    with _lock:
+        items = sorted(_groups.items(), key=lambda kv: -kv[1].get("last", 0))
+    total = len(items)
+    start = page * per
+    chunk = items[start:start + per]
+    return chunk, total, (start + per < total)
+
+def group_remove(cid) -> bool:
+    """حذف گروه از آمار (بعد از leave-chat) — True اگه بود."""
+    with _lock:
+        if _groups.pop(str(cid), None) is not None:
+            _save_debounced()
+            return True
+        return False
+
+def group_set_link(cid, link) -> None:
+    """ذخیره‌ی invite_link که bot.py موقع لازم شدن با export_chat_invite_link می‌گیره — بدون کش، مستقیم."""
+    with _lock:
+        g = _groups.get(str(cid))
+        if g is not None:
+            g["invite_link"] = link
+            _save_debounced()
 
 # ---------- broadcast ----------
 def all_user_ids() -> list:
