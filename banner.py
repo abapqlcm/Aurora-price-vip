@@ -311,7 +311,7 @@ def get_last_video_price(code: str):
     return _LAST_VIDEO_PRICE.get(ck)
 
 
-def render_banner_video(code: str, duration: float = 2.0, fps: int = 16) -> Optional[bytes]:
+def render_banner_video(code: str, duration: float = 3.0, fps: int = 24) -> Optional[bytes]:
     """۵. نمودار متحرک MP4 — خط با انیمیشن کشیده می‌شه + نقطه‌ی pulse.
     خروجی bytes (mp4/h264). کش ۶۰ ثانیه. fallback: None → فراخوان از PNG استفاده کنه."""
     ck = catalog.resolve(code) or code
@@ -365,19 +365,10 @@ def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps:
     if len(hist) < 2:
         return None
 
-    unit = data["unit"]
+    price = data["price"]
     pct = data.get("change_pct")
-    up = (hist[-1] >= hist[0])
-    line_color = GREEN if up else RED
 
-    # رنگ تأکیدی (برای نئون/ذرات/روشنایی) بر اساس نوع ارز
-    asset_type = _asset_type(code)
-    accent_color = COLORS_BY_TYPE.get(asset_type, COLORS_BY_TYPE["fiat"])["accent"]
-
-    # پس‌زمینه‌ی بنر **بدون نمودار** (خط static قدیمی حذف) — خط انیمیشنی تنها خطه
-    # omit_price=True → قیمت هر فریم با roll-up کشیده می‌شه (ایده ۲) نه در پس‌زمینه
-    # FIX: base cache key only by code+type (not price/pct) — base image is static per asset
-    # Price/chart overlay happens per-frame anyway via rollup_digits + chart drawing
+    # پس‌زمینه‌ی Ember بدون قیمت/نمودار (از رندر استاتیک — کش پایه مثل قبل)
     _bkey = (ck, _asset_type(code))
     _bhit = _VIDEO_BASE_CACHE.get(_bkey)
     if _bhit is not None:
@@ -388,56 +379,21 @@ def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps:
             return None
         base_img = Image.open(io.BytesIO(base_png)).convert("RGB")
         if len(_VIDEO_BASE_CACHE) > 12:
-            # Evict oldest entries instead of clearing all
             keys_to_remove = list(_VIDEO_BASE_CACHE.keys())[:len(_VIDEO_BASE_CACHE) - 12]
             for k in keys_to_remove:
                 del _VIDEO_BASE_CACHE[k]
         _VIDEO_BASE_CACHE[_bkey] = base_img.copy()
     Wv, Hv = base_img.size
 
-    # موقعیت دقیق نمودار: بدون no_chart، y بعد از buy/sell chip روی self_chart_top میفته
-    # بازتولید همون محاسبه: y = 36 + 110 (هدر) + 190 (قیمت) + 68/84 (chip) = ثابت‌ها
-    # → مطمئن‌ترین راه: از همون توابع استفاده کن و y_chart رو حساب کن
-    chart_x0 = 60 + 28
-    chart_w = Wv - 60 - 28 - 60 - 28
-    chart_h = 300
-    # y شروع نمودار: هدر(36+110=146) + قیمت(+190=336) + chip(68 اگر buy/sell یا 84 اگر pct)
-    # با no_chart رندر کردیم و y آخرین مقدار — دوباره محاسبه مثل _render_banner_uncached:
-    y_calc = 36 + 110 + 190
-    if data.get("buy") and data.get("sell") and data.get("buy") != data.get("sell"):
-        y_calc += 68
-    elif pct is not None:
-        y_calc += 84
-    chart_y0 = 50 + y_calc  # کارت در (card_margin, 50) کامپوزیت می‌شه
+    # لایه‌های از پیش رندرشده‌ی Ember (گرادیان قیمت، چیپ، هاله‌ی خورشید، نقاط نمودار)
+    grad = _ember_amber_grad()
+    chip_layer = _ember_chip_layer(pct)
+    glow = _ember_glow_layer()
+    cx0, cy0, cx1, cy1 = _EMBER_CHART
+    sm = _ember_smooth(hist, cx0, cy0, cx1, cy1)
+    hi, lo, frac = _ember_range(data, hist)
 
-    n = len(hist)
-    mn, mx = min(hist), max(hist)
-    # فالبک دوتایی/تخت: بازه رو ±0.6% باز کن تا خط به کف نچسبه و موج دیده بشه
-    if mx - mn < mx * 0.004:
-        mid = (mn + mx) / 2
-        mn, mx = mid * 0.994, mid * 1.006
-    if mx == mn:
-        mx = mn * 1.001 + 1
-    rng = mx - mn
-
-    PAD_T, PAD_B, PAD_X = 14, 10, 6
-    plot_h = chart_h - PAD_T - PAD_B
-
-    def y_of(v):
-        return chart_y0 + PAD_T + plot_h - (v - mn) / rng * plot_h
-
-    # نقاط smooth (همون Catmull-Rom بنر — خط شکسته نمی‌شه)
-    raw_pts = []
-    for i, v in enumerate(hist):
-        x = chart_x0 + PAD_X + i / (n - 1) * (chart_w - 2 * PAD_X)
-        raw_pts.append((x, y_of(v)))
-    smooth_pts = _smooth(raw_pts, steps=12)
-
-    # ۲۲. ffmpeg مستقیم با subprocess (imageio writer اینجا فایل خالی می‌سازه)
-    # نکته: فریم‌ها با numpy array باعث OOM می‌شن (کپی 900x950×3 × ۴۴ فریم) →
-    # به جاش از PIL مستقیم tobytes می‌فرستیم (RSS کم)
     _FF = imageio_ffmpeg.get_ffmpeg_exe()
-    # ۲۴. ابعاد زوج — شرط تلگرام برای animation (اتوپلی GIF)
     w, h = (Wv // 2) * 2, (Hv // 2) * 2
     if (w, h) != (Wv, Hv):
         base_img = base_img.crop((0, 0, w, h))
@@ -450,91 +406,88 @@ def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps:
              "-pix_fmt", "rgb24", "-r", str(fps), "-i", "-",
              "-an", "-vcodec", "libx264", "-preset", "ultrafast", "-tune", "animation", "-threads", "1",
              "-pix_fmt", "yuv420p",
-             "-movflags", "+faststart", "-crf", "23", tmp.name],
+             "-movflags", "+faststart", "-crf", "20", tmp.name],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             n_frames = int(duration * fps)
-            total = len(smooth_pts)
-            # ماسک clip نمودار — یک بار (نه هر فریم)
-            clip = (int(chart_x0), int(chart_y0), int(chart_x0 + chart_w), int(chart_y0 + chart_h - PAD_B))
-            _CHART_CLIP_MASK = Image.new("L", (w, h), 0)
-            ImageDraw.Draw(_CHART_CLIP_MASK).rectangle(clip, fill=255)
-            # موقعیت بج LIVE در بنر (کارت: margin 60، icon 28, y-10 → badge در 28+84+14=126, y+24)
-            # توجه: بنر no_chart بج نداره → اینجا هر فریم با pulse بکش (blink واقعی)
-            badge_x = 60 + 28 + 84 + 14
-            badge_y = 50 + 36 + 24
+            pf = _ember_price_font(price)
             for f in range(n_frames):
                 t = f / max(1, n_frames - 1)
-                eased = 1 - (1 - t) ** 3
-                img = base_img.copy()
+                tsec = f / fps
+                img = base_img.convert("RGBA")
+                # هاله‌ی خورشید — تنفس آرام
+                ga = glow.copy()
+                ga.putalpha(ga.split()[3].point(lambda v: int(v * (0.10 + 0.05 * math.sin(tsec * math.pi * 2 * 0.57)))))
+                img = Image.alpha_composite(img, ga)
+                # پیشرفت اصلی — یک محرک واحد برای قیمت + نمودار + نوار بازه (هم‌زمان، بدون عقب‌جلو)
+                mp = _ember_ease_io(_ember_clamp01((t - 0.06) / 0.56))
+                # قیمت — شمارش از صفر تا قیمت نهایی با گرادیان کهربایی
+                pv = price if t >= 0.64 else price * mp
+                pv_show = int(pv) if price >= 100 else pv
+                tm = Image.new("L", (W, H), 0)
+                ImageDraw.Draw(tm).text((84, 266), _fmt(pv_show), font=pf, fill=255)
+                img = Image.alpha_composite(img, Image.composite(grad, Image.new("RGBA", (W, H), (0, 0, 0, 0)), tm))
                 d = ImageDraw.Draw(img, "RGBA")
-                # ایده ۴ (فیکس): نئون چرخشی — مستقیم روی لبه‌ی «کارت» (۶۰,۵۰ تا w-۶۰,h-۱۱۰)
-                # قبلاً لبه‌ی تصویر کشیده می‌شد → دیده نمی‌شد و outline آبی ثابت می‌موند
-                try:
-                    _draw_card_neon(d, 60, 50, w - 60, h - 110, t)
-                except Exception as e_nb:
-                    log.warning("neon border frame: %s", e_nb)
-                # ۰) بج LIVE چشمک‌زن — دوره‌ی ۲.۴s نرم (بجای ۱s تند)
-                _draw_live_badge(d, badge_x, badge_y, pulse_t=(f / (fps * 2.4)) % 1.0)
-                # ذرات نورانی (برگشت — کاربر خواست بمونه) — seed per-frame تا ذرات حرکت کنن
-                try:
-                    _draw_particles(d, w, h, t, accent_color, seed=42 + f)
-                except Exception as e_p:
-                    log.warning("particles frame: %s", e_p)
-                # ۱۰. پالس لوگو — هاله‌ی دایره‌ای دور لوگوی گوشه (موج نرم + محو)
-                try:
-                    lx, ly, lr = w - 100, h - 105, 46  # مرکز لوگو
-                    _pulse = (t * math.pi * 2) % (2 * math.pi)
-                    _ring_r = lr + 10 + int(26 * (0.5 + 0.5 * math.sin(_pulse)))
-                    _ring_a = int(120 * (0.5 - 0.5 * math.sin(_pulse)))
-                    if _ring_a > 4:
-                        d.ellipse((lx - _ring_r, ly - _ring_r, lx + _ring_r, ly + _ring_r),
-                                  outline=accent_color[:3] + (_ring_a,), width=2)
-                except Exception as e_pc:
-                    log.warning("logo pulse frame: %s", e_pc)
-                # ایده ۲: roll-up قیمت — ۴۰٪ اول انیمیت، بعد ثابت
-                try:
-                    _rollup_digits(img, w // 2, 50 + 36 + 110 + 56, data["price"],
-                                   min(1.0, t / 0.4), unit=unit)
-                except Exception as e_ru:
-                    log.warning("rollup frame: %s", e_ru)
-                # (ایده ۳ fade و ایده ۱ shine حذف شد — کاربر نخواست)
-                # ۱) گرادیان زیر خط — فقط بخش کشیده‌شده، محدود به کادر نمودار
-                idx_end = max(2, int(2 + (total - 2) * eased))
-                pts = smooth_pts[:idx_end]
-                if len(pts) >= 2:
-                    chart_top = chart_y0
-                    chart_bot = chart_y0 + chart_h - PAD_B
-                    poly = list(pts) + [(pts[-1][0], chart_bot),
-                                        (pts[0][0], chart_bot)]
-                    mask = Image.new("L", (w, h), 0)
-                    md = ImageDraw.Draw(mask)
-                    md.polygon(poly, fill=52)
-                    # clip به کادر نمودار (AND با ماسک clip — سریع)
-                    mask = ImageChops.darker(mask, _CHART_CLIP_MASK)
-                    grad = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-                    gd4 = ImageDraw.Draw(grad)
-                    yy0 = max(int(min(p[1] for p in pts)), int(chart_top))
-                    for yy in range(yy0, int(chart_bot)):
-                        alpha = max(0, int(80 * (1 - (yy - yy0) / max(1, chart_bot - yy0))))
-                        gd4.line([(clip[0], yy), (clip[2], yy)], fill=line_color + (alpha,))
-                    img.paste(grad, (0, 0), mask)
-                    d2 = ImageDraw.Draw(img, "RGBA")
-                    # ۲) گلو + خط smooth (نرم — بدون شکستگی)
-                    d2.line(pts, fill=line_color + (70,), width=10, joint="curve")
-                    d2.line(pts, fill=line_color + (120,), width=6, joint="curve")
-                    d2.line(pts, fill=line_color + (255,), width=4, joint="curve")
-                    # ۳) نقطه‌ی سر متحرک با pulse
+                # نمودار — کشیده‌شدن هم‌زمان با قیمت
+                if mp > 0:
+                    n = max(2, int(len(sm) * mp))
+                    pts = sm[:n]
+                    fa = int(46 * _ember_clamp01((t - 0.22) / 0.34))
+                    if fa > 0:
+                        fl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+                        ImageDraw.Draw(fl).polygon(pts + [(pts[-1][0], cy1), (cx0, cy1)], fill=(255, 154, 60, fa))
+                        img = Image.alpha_composite(img, fl)
+                        d = ImageDraw.Draw(img, "RGBA")
+                    d.line(pts, fill=(255, 154, 60, 90), width=7, joint="curve")
+                    d.line(pts, fill=(255, 205, 140, 255), width=3, joint="curve")
                     ex, ey = pts[-1]
-                    pr = 6 + 3 * math.sin(f / n_frames * math.pi * 4)
-                    for r, a in [(int(pr * 2.2), 60), (int(pr * 1.5), 130), (int(pr), 255)]:
-                        d2.ellipse((ex - r, ey - r, ex + r, ey + r), fill=line_color + (a,))
-                proc.stdin.write(img.tobytes())  # بدون numpy — RSS کم
+                    pulse = 0.5 + 0.5 * math.sin(tsec * math.pi * 4)
+                    d.ellipse((ex - 10, ey - 10, ex + 10, ey + 10), fill=(255, 170, 90, int(40 + 40 * pulse)))
+                    d.ellipse((ex - 5, ey - 5, ex + 5, ey + 5), fill=(255, 244, 224, 255))
+                # نوار بازه — لغزش یک‌طرفه از LOW تا جای واقعی قیمت (با همان mp)
+                if t >= 0.06:
+                    mxp = 88 + (812 - 88) * (frac * mp)
+                    d.rounded_rectangle((88, 746, mxp, 754), 4, fill=(255, 170, 60, 230))
+                    d.ellipse((mxp - 9, 741, mxp + 9, 759), fill=(255, 244, 224, 255), outline=(255, 154, 60, 255), width=2)
+                # چیپ درصد — ورود نرم نزدیک پایان sweep
+                cp = _ember_clamp01((t - 0.60) / 0.14)
+                if cp > 0 and chip_layer is not None:
+                    ch = chip_layer.copy()
+                    ch.putalpha(ch.split()[3].point(lambda v: int(v * cp)))
+                    img.alpha_composite(ch, (0, int((1 - cp) * 10)))
+                    d = ImageDraw.Draw(img, "RGBA")
+                # بج LIVE — چشمک واقعی روشن/خاموش (دوره‌ی ۱٫۲ ثانیه)
+                cyc = (tsec % 1.2) / 1.2
+                bright = 0.10 + 0.90 * ((0.5 + 0.5 * math.sin(cyc * math.pi * 2 - math.pi / 2)) ** 1.3)
+                def _lc(c0, c1, k):
+                    return tuple(int(c0[i] + (c1[i] - c0[i]) * k) for i in range(3)) + (255,)
+                rr_ = 8 + 9 * cyc
+                d.ellipse((715 - rr_, 110 - rr_, 715 + rr_, 110 + rr_),
+                          outline=_lc((96, 58, 26), (255, 170, 90), bright * (1 - cyc)), width=2)
+                d.ellipse((715 - 9, 110 - 9, 715 + 9, 110 + 9), fill=_lc((70, 42, 20), (150, 92, 40), bright))
+                d.ellipse((715 - 6, 110 - 6, 715 + 6, 110 + 6), fill=_lc((120, 70, 28), (255, 199, 116), bright))
+                # ذرات جرقه‌ی شناور
+                pov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+                pd = ImageDraw.Draw(pov)
+                for p in _EMBER_PARTS:
+                    py = (p["y"] - p["sp"] * tsec) % 950
+                    px = p["x"] + math.sin(tsec * p["fq"] + p["ph"]) * p["amp"]
+                    twk = 0.55 + 0.45 * math.sin(tsec * 2.2 + p["tw"])
+                    rad = p["r"]
+                    pd.ellipse((px - rad * 3, py - rad * 3, px + rad * 3, py + rad * 3), fill=p["col"] + (int(26 * twk),))
+                    pd.ellipse((px - rad, py - rad, px + rad, py + rad), fill=p["col"] + (int(215 * twk),))
+                img = Image.alpha_composite(img, pov)
+                d = ImageDraw.Draw(img, "RGBA")
+                # حلقه‌ی سونار دور لوگو (چسبیده + موج ملایم)
+                sp_ = (tsec % 1.5) / 1.5
+                sr = 40 + 13 * sp_
+                d.ellipse((836 - sr, 886 - sr, 836 + sr, 886 + sr), outline=(255, 170, 90, int(110 * (1 - sp_))), width=2)
+                proc.stdin.write(img.convert("RGB").tobytes())
             proc.stdin.close()
         except BrokenPipeError:
             pass
         try:
-            proc.wait(timeout=30)  # فیکس: هنگ ffmpeg رندر رو برای همیشه فریز نکنه
+            proc.wait(timeout=30)
         except Exception as e_w:
             log.warning("video ffmpeg wait %s: %s", code, e_w)
             proc.kill()
@@ -552,6 +505,7 @@ def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps:
     _MP4_CACHE[ck] = (now, out)
     _cache_cap(_MP4_CACHE)
     return out
+
 
 
 def _code_ids(code: str):
@@ -1049,11 +1003,297 @@ def render_banner_base_no_chart(code: str, omit_price: bool = False) -> Optional
         return _render_banner_uncached(code, ck, now, no_chart=True, omit_price=omit_price)
 
 
+# ================= Ember theme (جایگزین طراحی بنر — ۲۰۲۶-۱۱-۲۵) =================
+# طراحی Ember Sunset: کارت شیشه‌ای گرم روی گرادیان آلویی-نارنجی، قیمت کهربایی،
+# نمودار و نوار بازه‌ی هم‌زمان. entry pointها و کش‌ها دست نخورده‌اند.
+_EMBER_CHART = (84, 548, 816, 668)
+_EMBER_CREAM = (255, 244, 224, 255)
+_EMBER_MUT = (232, 183, 148, 255)
+_EMBER_BACKDROP = None
+_EMBER_GRAD = None
+_EMBER_GLOW = None
+
+
+def _ember_clamp01(v):
+    return max(0.0, min(1.0, v))
+
+
+def _ember_ease_io(t):
+    return 4 * t ** 3 if t < 0.5 else 1 - ((-2 * t + 2) ** 3) / 2
+
+
+def _ember_vgrad(stops):
+    g = Image.new("RGB", (1, H))
+    for y in range(H):
+        t = y / H
+        for i in range(len(stops) - 1):
+            p0, c0 = stops[i]
+            p1, c1 = stops[i + 1]
+            if p0 <= t <= p1:
+                k = (t - p0) / max(1e-6, p1 - p0)
+                g.putpixel((0, y), tuple(int(c0[j] + (c1[j] - c0[j]) * k) for j in range(3)))
+                break
+    return g.resize((W, H))
+
+
+def _ember_backdrop():
+    """پس‌زمینه + کارت Ember — مستقل از ارز، یک بار ساخته و کش می‌شود."""
+    global _EMBER_BACKDROP
+    if _EMBER_BACKDROP is not None:
+        return _EMBER_BACKDROP.copy()
+    img = _ember_vgrad([(0, (27, 11, 46)), (0.45, (59, 16, 57)), (0.75, (122, 46, 29)), (1, (24, 10, 20))]).convert("RGBA")
+    sun = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(sun).ellipse((430, 300, 1010, 880), fill=(255, 154, 60, 130))
+    img = Image.alpha_composite(img, sun.filter(ImageFilter.GaussianBlur(70)))
+    sun2 = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(sun2).ellipse((600, 440, 880, 720), fill=(255, 190, 90, 120))
+    img = Image.alpha_composite(img, sun2.filter(ImageFilter.GaussianBlur(40)))
+    dr = ImageDraw.Draw(img)
+    rr = random.Random(11)
+    for _ in range(90):
+        x, y = rr.randint(0, W), rr.randint(0, int(H * 0.45))
+        dr.ellipse((x, y, x + 2, y + 2), fill=(255, 240, 220, rr.randint(20, 70)))
+    sh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(sh).rounded_rectangle((44, 52, 856, 848), 36, fill=(0, 0, 0, 130))
+    img = Image.alpha_composite(img, sh.filter(ImageFilter.GaussianBlur(14)))
+    card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(card).rounded_rectangle((44, 40, 856, 836), 36, fill=(26, 12, 16, 178), outline=(255, 170, 90, 90), width=2)
+    img = Image.alpha_composite(img, card)
+    vig_mask = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(vig_mask).ellipse((-180, -160, 1080, 1110), fill=255)
+    vig_mask = vig_mask.filter(ImageFilter.GaussianBlur(120))
+    vig = Image.new("RGBA", (W, H), (0, 0, 0, 255))
+    vig.putalpha(ImageChops.invert(vig_mask).point(lambda v: int(v * 0.35)))
+    img = Image.alpha_composite(img, vig)
+    _EMBER_BACKDROP = img
+    return img.copy()
+
+
+def _ember_amber_grad():
+    global _EMBER_GRAD
+    if _EMBER_GRAD is None:
+        _EMBER_GRAD = _ember_vgrad([(0, (255, 227, 179)), (0.55, (255, 170, 60)), (1, (214, 106, 28))]).convert("RGBA")
+    return _EMBER_GRAD
+
+
+def _ember_glow_layer():
+    global _EMBER_GLOW
+    if _EMBER_GLOW is None:
+        g = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(g).ellipse((430, 300, 1010, 880), fill=(255, 154, 60, 255))
+        _EMBER_GLOW = g.filter(ImageFilter.GaussianBlur(70))
+    return _EMBER_GLOW
+
+
+_prnd = random.Random(7)
+_EMBER_PARTS = [dict(x=_prnd.uniform(70, 830), y=_prnd.uniform(0, 950), sp=_prnd.uniform(7, 18),
+                     amp=_prnd.uniform(4, 11), fq=_prnd.uniform(0.5, 1.4), ph=_prnd.uniform(0, 6.28),
+                     r=_prnd.uniform(1.1, 2.8), tw=_prnd.uniform(0, 6.28),
+                     col=_prnd.choice([(255, 170, 90), (255, 205, 140), (255, 128, 66)]))
+                for _ in range(26)]
+
+
+def _ember_ticker(std: str) -> str:
+    if std in catalog.CRYPTO:
+        return std
+    if std in catalog.GOLD:
+        return "GOLD"
+    return {"dollar": "USD", "euro": "EUR", "pound": "GBP"}.get(std, catalog.display_en(std))
+
+
+def _ember_price_font(price) -> ImageFont.FreeTypeFont:
+    """فونت قیمت — برای عددهای خیلی بلند (سکه) خودکار کوچک می‌شود تا از کارت بیرون نزند."""
+    size = 100
+    probe = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+    while size > 52 and probe.textlength(_fmt(price), font=_font(size, "b")) > 680:
+        size -= 8
+    return _font(size, "b")
+
+
+def _ember_range(data, hist):
+    """(hi, lo, frac) — اول high/low واقعی ۲۴ساعته‌ی دیتا، وگرنه از تاریخچه."""
+    price = data["price"]
+    hi = data.get("high_24")
+    lo = data.get("low_24")
+    if not hi or not lo or hi <= lo:
+        vals = [float(x) for x in (hist or []) if x] or [price]
+        lo, hi = min(vals), max(vals)
+    lo = min(lo, price)
+    hi = max(hi, price)
+    frac = (price - lo) / (hi - lo) if hi > lo else 0.5
+    return hi, lo, frac
+
+
+def _ember_smooth(vals, x0, y0, x1, y1):
+    """Catmull-Rom روی مقادیر تاریخچه — خروجی: نقاط (x,y) نرم برای نمودار."""
+    vals = [float(v) for v in vals]
+    if len(vals) < 2:
+        vals = vals + vals
+    mn, mx = min(vals), max(vals)
+    pad = (mx - mn) * 0.12 or 1
+    pts = [(x0 + (x1 - x0) * i / (len(vals) - 1),
+            y1 - (y1 - y0) * (v - mn + pad) / (mx - mn + 2 * pad)) for i, v in enumerate(vals)]
+    sm = []
+    for i in range(len(pts) - 1):
+        p0 = pts[max(0, i - 1)]
+        p1 = pts[i]
+        p2 = pts[i + 1]
+        p3 = pts[min(len(pts) - 1, i + 2)]
+        for j in range(10):
+            t = j / 10
+            sm.append((0.5 * ((2 * p1[0]) + (-p0[0] + p2[0]) * t + (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t ** 2 + (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t ** 3),
+                       0.5 * ((2 * p1[1]) + (-p0[1] + p2[1]) * t + (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t ** 2 + (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t ** 3)))
+    sm.append(pts[-1])
+    return sm
+
+
+def _ember_icon(code: str, std: str):
+    """دایره‌ی آیکون ۸۸×۸۸ — پرچم/لوگوی ارز؛ طلا: شمش؛ فالبک: حروف نماد."""
+    disc = Image.new("RGBA", (88, 88), (0, 0, 0, 0))
+    dd = ImageDraw.Draw(disc)
+    dd.ellipse((0, 0, 87, 87), fill=(20, 28, 48, 235), outline=(150, 180, 255, 90), width=2)
+    img = None
+    if std == "TON" and os.path.exists("assets/ton_icon.png"):
+        try:
+            img = Image.open("assets/ton_icon.png").convert("RGBA")
+        except Exception:
+            img = None
+    if img is None:
+        try:
+            img = _fetch_bg_image(code)
+        except Exception:
+            img = None
+    if img is not None:
+        ic = img.convert("RGBA").resize((67, 67), Image.LANCZOS)
+        m = Image.new("L", (67, 67), 0)
+        ImageDraw.Draw(m).ellipse((2, 2, 65, 65), fill=255)
+        disc.paste(ic, (10, 10), m)
+        return disc
+    if _asset_type(code) == "gold":
+        try:
+            ing = _gold_ingot_logo(76)
+            if ing is not None:
+                disc.alpha_composite(ing.convert("RGBA"), (6, 6))
+                return disc
+        except Exception:
+            pass
+    dd.text((44, 44), _ember_ticker(std)[:4], font=_font(22, "b"), fill=_EMBER_CREAM, anchor="mm")
+    return disc
+
+
+def _ember_chip_layer(pct):
+    """لایه‌ی چیپ درصد تغییر + برچسب PAST 24 HOURS (None اگر pct نداریم)."""
+    if pct is None:
+        return None
+    up = pct >= 0
+    acc = (52, 211, 153) if up else (248, 113, 113)
+    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    cd = ImageDraw.Draw(layer)
+    txt = f"{abs(pct):.2f}%"
+    cf = _font(27, "b")
+    cw = cd.textlength(txt, font=cf) + 62
+    cd.rounded_rectangle((84, 446, 84 + cw, 500), 27, fill=acc + (36,), outline=acc + (150,), width=1)
+    if up:
+        cd.polygon((112, 460, 104, 476, 120, 476), fill=acc + (255,))
+    else:
+        cd.polygon((112, 486, 104, 470, 120, 470), fill=acc + (255,))
+    cd.text((130, 458), txt, font=cf, fill=acc + (255,), anchor="la")
+    cd.text((84 + cw + 16, 460), "P A S T   2 4   H O U R S", font=_font(16, "m"), fill=_EMBER_MUT, anchor="la")
+    return layer
+
+
+def _ember_base_image(code: str, data: dict, hist, full: bool):
+    """تصویر Ember — full=True: بنر کامل استاتیک؛ full=False: پایه‌ی ویدیو (بدون قیمت/نمودار/چیپ)."""
+    std = catalog.resolve(code) or code
+    price = data["price"]
+    pct = data.get("change_pct")
+    img = _ember_backdrop()
+    dr = ImageDraw.Draw(img)
+    img.alpha_composite(_ember_icon(code, std), (84, 84))
+    dr = ImageDraw.Draw(img)
+    title = "US DOLLAR" if std == "dollar" else catalog.display_en(std)
+    dr.text((196, 94), title, font=_font(42, "b"), fill=_EMBER_CREAM, anchor="la")
+    dr.text((198, 150), f"EMBER · {_ember_ticker(std)}", font=_font(16, "m"), fill=_EMBER_MUT, anchor="la")
+    # بج LIVE (قرص) — نقطه در حالت استاتیک روشن ثابت؛ در ویدیو هر فریم چشمک می‌زند
+    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(ov).rounded_rectangle((692, 88, 816, 132), 22, fill=(255, 154, 60, 30), outline=(255, 170, 90, 130), width=1)
+    img = Image.alpha_composite(img, ov)
+    dr = ImageDraw.Draw(img)
+    dr.text((732, 100), "LIVE", font=_font(20, "b"), fill=(255, 226, 188, 255), anchor="la")
+    if full:
+        dr.ellipse((706, 101, 724, 119), fill=(150, 92, 40, 255))
+        dr.ellipse((709, 104, 721, 116), fill=(255, 199, 116, 255))
+    dr.text((84, 238), "L I V E   P R I C E", font=_font(18, "m"), fill=_EMBER_MUT, anchor="la")
+    # واحد کنار قیمت — موقعیتش از پهنای قیمت نهایی حساب می‌شود (در هر دو حالت)
+    unit = "USD" if _asset_type(code) == "crypto" else "TOMAN"
+    pf = _ember_price_font(price)
+    tw = dr.textlength(_fmt(price), font=pf)
+    dr.text((84 + tw + 16, 310), unit, font=_font(28, "b"), fill=(255, 205, 140, 255), anchor="la")
+    hi, lo, frac = _ember_range(data, hist)
+    # برچسب‌های بازه + ترک کم‌رنگ (در هر دو حالت)
+    dr.text((88, 684), "LOW", font=_font(16, "m"), fill=_EMBER_MUT, anchor="la")
+    dr.text((88, 712), _fmt(lo), font=_font(21, "b"), fill=_EMBER_CREAM, anchor="la")
+    dr.text((812, 684), "HIGH", font=_font(16, "m"), fill=_EMBER_MUT, anchor="ra")
+    dr.text((812, 712), _fmt(hi), font=_font(21, "b"), fill=_EMBER_CREAM, anchor="ra")
+    ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(ov).rounded_rectangle((88, 746, 812, 754), 4, fill=(255, 220, 180, 46))
+    img = Image.alpha_composite(img, ov)
+    dr = ImageDraw.Draw(img)
+    if full:
+        # قیمت با گرادیان کهربایی
+        tm = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(tm).text((84, 266), _fmt(price), font=pf, fill=255)
+        img = Image.alpha_composite(img, Image.composite(_ember_amber_grad(), Image.new("RGBA", (W, H), (0, 0, 0, 0)), tm))
+        dr = ImageDraw.Draw(img)
+        # چیپ درصد
+        chip = _ember_chip_layer(pct)
+        if chip is not None:
+            img = Image.alpha_composite(img, chip)
+            dr = ImageDraw.Draw(img)
+        # نمودار کامل
+        cx0, cy0, cx1, cy1 = _EMBER_CHART
+        sm = _ember_smooth(hist, cx0, cy0, cx1, cy1)
+        fl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(fl).polygon(sm + [(cx1, cy1), (cx0, cy1)], fill=(255, 154, 60, 46))
+        img = Image.alpha_composite(img, fl)
+        dr = ImageDraw.Draw(img)
+        dr.line(sm, fill=(255, 154, 60, 90), width=7, joint="curve")
+        dr.line(sm, fill=(255, 205, 140, 255), width=3, joint="curve")
+        ex, ey = sm[-1]
+        dr.ellipse((ex - 10, ey - 10, ex + 10, ey + 10), fill=(255, 170, 90, 110))
+        dr.ellipse((ex - 5, ey - 5, ex + 5, ey + 5), fill=(255, 244, 224, 255))
+        # نوار بازه — پرشده تا جای واقعی قیمت + مارکر
+        mxp = 88 + (812 - 88) * frac
+        dr.rounded_rectangle((88, 746, mxp, 754), 4, fill=(255, 170, 60, 230))
+        dr.ellipse((mxp - 9, 741, mxp + 9, 759), fill=(255, 244, 224, 255), outline=(255, 154, 60, 255), width=2)
+    # فوتر — لوگو + حلقه‌ی چسبیده + امضا
+    try:
+        lg = Image.open("assets/logo_circle.png").convert("RGBA")
+        img.paste(lg, (800, 850), lg)
+    except Exception:
+        pass
+    dr = ImageDraw.Draw(img)
+    dr.ellipse((796, 846, 876, 926), outline=(255, 170, 90, 150), width=2)
+    dr.text((785, 886), "AuroraPriceBot · @iprez", font=_font(24, "b"), fill=(255, 240, 224, 220), anchor="rm")
+    return img
+
+
+def _ember_render_banner(code: str, ck: str, now: float, data: dict, hist, no_chart: bool) -> Optional[bytes]:
+    img = _ember_base_image(code, data, hist, full=not no_chart)
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, "PNG")
+    if no_chart:
+        # بنر ویدیویی کش نمی‌شه (موقته) — فقط برگرد
+        return buf.getvalue()
+    _PNG_CACHE[ck] = (now, buf.getvalue())
+    _cache_cap(_PNG_CACHE)
+    return _PNG_CACHE[ck][1]
+
+
 def _render_banner_uncached(code: str, ck: str, now: float, no_chart: bool = False,
                             omit_price: bool = False) -> Optional[bytes]:
     """رندر واقعی بنر — فقط از render_banner صدا زده شه (lock گرفته شده).
-    no_chart=True → بنر بدون نمودار (برای پس‌زمینه‌ی ویدیوی انیمیشنی).
-    omit_price=True → قیمت حذف، ولی y همون‌قدر (+190) جلو می‌ره (جای ویدیو)."""
+    no_chart=True → پایه‌ی Ember بدون نمودار/قیمت (پس‌زمینه‌ی ویدیوی انیمیشنی)."""
     data = datafeeds.get_banner_data(code)
     if not data or not data.get("price"):
         return None
@@ -1068,7 +1308,6 @@ def _render_banner_uncached(code: str, ck: str, now: float, no_chart: bool = Fal
         datafeeds.record_snapshot(catalog.resolve(code))
 
     price = data["price"]
-    pct = data.get("change_pct")
     if not data.get("updated"):
         ir = timezone(timedelta(hours=3, minutes=30))
         data["updated"] = datetime.now(ir).strftime("%H:%M:%S")
@@ -1081,275 +1320,4 @@ def _render_banner_uncached(code: str, ck: str, now: float, no_chart: bool = Fal
         else:
             hist = [price * 0.999, price]
 
-    # ---- پس‌زمینه اختصاصی تون ---
-    _TON_LOGO_BIG = None
-    if code == "TON":
-        # بک‌گراند خفن تون: تیره آبی + هاله نئون + لوگوی بزرگ نیمه‌شفاف وسط
-        base = Image.new("RGB", (W, H), (8, 16, 30))
-        bd = ImageDraw.Draw(base)
-        for y in range(H):
-            t = y / H
-            c = (int(6 + 10 * t), int(14 + 16 * t), int(28 + 24 * t))
-            bd.line([(0, y), (W, y)], fill=c)
-        try:
-            _ton_cache = _TON_BG_CACHE.get("bg")
-            if _ton_cache is not None:
-                base = _ton_cache.copy()
-                _TON_LOGO_BIG = Image.open("assets/ton_icon.png").convert("RGBA")
-            else:
-                _ton_logo_full = Image.open("assets/ton_icon.png").convert("RGBA")
-                base = base.convert("RGBA")
-                blue_glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-                gd_glow = ImageDraw.Draw(blue_glow)
-                gd_glow.ellipse((W//2 - 300, H//2 - 300, W//2 + 300, H//2 + 300),
-                                fill=(0, 130, 220, 60))
-                blue_glow = blue_glow.filter(ImageFilter.GaussianBlur(80))
-                base.alpha_composite(blue_glow)
-                base = base.convert("RGB")
-                _TON_BG_CACHE["bg"] = base.copy()
-                _TON_LOGO_BIG = _ton_logo_full
-        except Exception as e_tonbg:
-            log.warning("TON bg: %s", e_tonbg)
-            base = base.convert("RGB") if base.mode == "RGBA" else base
-        asset_type = "crypto"
-        kind = "crypto"
-    else:
-        bg = _fetch_bg_image(code)
-        kind = None
-        asset_type = _asset_type(code)
-        if bg is None:
-            _, kind, key = catalog.asset_urls(code)
-        if asset_type == "gold" and bg is None:
-            base = _get_gold_bg().copy()
-        elif bg is not None:
-            base = _blurred_bg(bg, color_type=asset_type)
-        else:
-            base = Image.new("RGB", (W, H), (12, 12, 16))
-            bd = ImageDraw.Draw(base)
-            for y in range(H):
-                t = y / H
-                c = (int(12 + 20 * t), int(12 + 14 * t), int(16))
-                bd.line([(0, y), (W, y)], fill=c)
-            # لوگوی بزرگ‌تر در پس‌زمینه
-            try:
-                bd.ellipse((W//2-260, H//2-260, W//2+260, H//2+260), outline=(212, 175, 55), width=6)
-                bd.ellipse((W//2-200, H//2-200, W//2+200, H//2+200), outline=(212, 175, 55, 120), width=2)
-            except Exception:
-                pass
-
-    # ۸. تم تخصصی هر دسته (شبکه کریپتو / هاله تتر / موج ارز) روی پس‌زمینه
-    try:
-        base = _apply_asset_theme(base, asset_type)
-    except Exception as e_th:
-        log.warning("asset theme: %s", e_th)
-
-    # ---- کارت شیشه‌ای ----
-    card_margin = 60
-    card = Image.new("RGBA", (W - card_margin * 2, H - card_margin * 2 - 40), (0, 0, 0, 0))
-    cd = ImageDraw.Draw(card)
-    cw, ch = card.size
-
-    # ۴. رنگ‌ها بر اساس نوع ارز
-    colors = COLORS_BY_TYPE.get(asset_type, COLORS_BY_TYPE["fiat"])
-    card_outline = colors["accent"]  # حاشیه رنگی
-    
-    # کارت نیمه‌شفاف + حاشیه رنگی — گلاس‌مورفیسم واقعی (شفاف‌تر + مات‌تر)
-    cd.rounded_rectangle((0, 0, cw - 1, ch - 1), radius=36, fill=(16, 16, 24, 110),
-                         outline=card_outline + (200,), width=3)  # width=3 برای نیون
-    
-    # ۱۴. نیون گلو — هاله‌ی نور دور کارت (چند لایه outline محو)
-    glow_layer = Image.new("RGBA", card.size, (0, 0, 0, 0))
-    gd3 = ImageDraw.Draw(glow_layer)
-    for gw, ga in [(10, 40), (6, 70), (3, 110)]:
-        gd3.rounded_rectangle((-gw // 2, -gw // 2, cw - 1 + gw // 2, ch - 1 + gw // 2),
-                              radius=36 + gw // 2, outline=card_outline + (ga,), width=gw)
-    glow_layer = glow_layer.filter(ImageFilter.GaussianBlur(6))
-    card.alpha_composite(glow_layer)
-
-    y = 36
-    # --- عنوان + پرچم + بج LIVE --- (عنوان بنر همیشه EN — مقاوم به RTL/raqm)
-    f_title = _font(44, "b")
-    title = catalog.display_en(code)
-    cd.text((cw - 36, y), title, font=f_title, fill=WHITE, anchor="ra")
-    # ۲۰. بج LIVE گوشه‌ی چپ بالا (کنار آیکون)
-    if not no_chart:
-        _draw_live_badge(cd, 28 + 84 + 14, y + 24)
-
-    # پرچم/آیکون دایره‌ای
-    y_icon = y  # محل آیکون (برای حلقه‌ی پیشرفت طلا)
-    icon_img = _fetch_bg_image(code)
-    if icon_img is None and asset_type == "gold":
-        # ۲۷. طلا/سکه — لوگوی شمش طلای سه‌بعدی (به‌جای متن Au)
-        try:
-            _ing = _gold_ingot_logo(84)
-            card.alpha_composite(_ing, (28, y - 10))
-        except Exception as e_gold:
-            log.warning("gold ingot logo: %s", e_gold)
-    elif code == "TON":
-        # لوگوی واقعی تون (آیکون لوکال assets/ton_icon.png)
-        try:
-            s = 84
-            tic = Image.open("assets/ton_icon.png").convert("RGBA").resize((s, s), Image.LANCZOS)
-            mask = Image.new("L", (s, s), 0)
-            ImageDraw.Draw(mask).ellipse((0, 0, s, s), fill=255)
-            card.paste(tic, (28, y - 10), mask)
-        except Exception as e_tonic:
-            log.warning("TON icon: %s", e_tonic)
-            s = 84
-            icon = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-            idraw = ImageDraw.Draw(icon)
-            idraw.ellipse((0, 0, s, s), fill=(0, 168, 238, 255))
-            f_ton = _font(36, "b")
-            idraw.text((s//2, s//2), "TON", font=f_ton, fill=(255, 255, 255), anchor="mm")
-            card.paste(icon, (28, y - 10), icon)
-    elif icon_img is not None:
-        s = 84
-        ic = icon_img.resize((s, s), Image.LANCZOS)
-        if ic.mode != "RGBA":
-            ic = ic.convert("RGBA")
-        mask = Image.new("L", (s, s), 0)
-        ImageDraw.Draw(mask).ellipse((0, 0, s, s), fill=255)
-        card.paste(ic, (28, y - 10), mask)
-    else:
-        cd.ellipse((28, y - 6, 28 + 76, y + 70), outline=GOLD + (255,), width=3)
-        f_icon = _font(40, "b")
-        glyph = {"gold": "Au", "coin": "🪙", "usdt": "₮"}.get(kind or "", "★")
-        cd.text((28 + 38, y + 32), glyph, font=f_icon, fill=GOLD_BRIGHT, anchor="mm")
-    # ۹. حلقه‌ی پیشرفت دور لوگوی طلا — موقعیت قیمت در بازه ۲۴س
-    if asset_type == "gold" and data.get("high_24") and data.get("low_24"):
-        try:
-            hi = data["high_24"]; lo = data["low_24"]
-            if hi > lo:
-                frac = (price - lo) / (hi - lo)
-                _draw_progress_ring(cd, 28 + 42, y_icon + 32, 52, frac, GOLD_BRIGHT)
-        except Exception:
-            pass
-    y += 110
-
-    # --- قیمت اصلی (تایپوگرافی بزرگ‌تر + واحد در چیپ جدا) ---
-    f_price = _font(104, "b")
-    unit = data["unit"]
-    if not omit_price:
-        price_txt = f"{_fmt(price)} {unit if unit=='دلار' else ''}".strip()
-        cd.text((cw // 2, y + 56), price_txt, font=f_price, fill=GOLD_BRIGHT, anchor="mm")
-        if unit == "تومان":
-            # ۹. واحد تو چیپ جدا (EN — مقاوم به RTL)
-            chip_txt = "TOMAN"
-            f_chip = _font(28, "b")
-            chw = cd.textlength(chip_txt, font=f_chip)
-            cx1 = cw // 2 - chw / 2 - 24
-            cx2 = cw // 2 + chw / 2 + 24
-            cd.rounded_rectangle((cx1, y + 122, cx2, y + 122 + 46), radius=23,
-                                 fill=(255, 255, 255, 24), outline=GRAY + (120,), width=1)
-            cd.text((cw // 2, y + 122 + 23), chip_txt, font=f_chip, fill=GRAY, anchor="mm")
-    y += 190
-
-    # بازه خرید/فروش صرافی
-    y_chip = y
-    buy_v = data.get("buy")
-    sell_v = data.get("sell")
-    if buy_v and sell_v and buy_v != sell_v:
-        f_bs = _font(24, "b")
-        bs_txt = f"فروش {render_fa_num(sell_v)}  ·  خرید {render_fa_num(buy_v)}"
-        tw = cd.textlength(_rtl(_fa(bs_txt)), font=f_bs)
-        bx1 = cw // 2 - tw / 2 - 26
-        bx2 = cw // 2 + tw / 2 + 26
-        cd.rounded_rectangle((bx1, y, bx2, y + 48), radius=24,
-                             fill=(255, 255, 255, 20), outline=card_outline + (150,), width=2)
-        cd.text((cw // 2, y + 24), _rtl(_fa(bs_txt)), font=f_bs, fill=WHITE, anchor="mm")
-        y += 68
-    elif pct is not None:
-        up = pct >= 0
-        color = GREEN if up else RED
-        sign = "+" if up else ""
-        label = f"{sign}{pct:.2f}%  24H"
-        f_chg = _font(30, "b")
-        tw = cd.textlength(label, font=f_chg)
-        bx1 = cw // 2 - tw / 2 - 28
-        bx2 = cw // 2 + tw / 2 + 28
-        cd.rounded_rectangle((bx1, y, bx2, y + 56), radius=28, fill=color + (46,),
-                             outline=color + (220,), width=2)
-        cd.text((cw // 2, y + 28), label, font=f_chg, fill=color, anchor="mm")
-        y += 84
-
-    # ۸. جداکننده‌ی شمش طلایی (فقط طلا) بین چیپ و نمودار
-    if asset_type == "gold" and not no_chart:
-        _draw_gold_ingot_divider(cd, 28, cw - 28, y)
-        y += 18
-    # ۷. بج جهش وقتی |٪|≥۲ — کنار چیپ
-    if pct is not None and abs(pct) >= 2.0:
-        _draw_surge_badge(cd, cw - 160, y_chip, card_outline)
-
-    # --- نمودار ---
-    chart_h = 300
-    if len(hist) >= 3 and not no_chart:
-        up = (hist[-1] >= hist[0])
-        ohlcv_data = data.get("ohlcv")
-        candlestick = ohlcv_data is not None and len(ohlcv_data) >= 8
-        chart = _area_chart(hist, cw - 56, chart_h, up, ohlcv=ohlcv_data, candlestick=candlestick)
-        card.paste(chart, (28, y), chart)
-        y += chart_h + 20
-        # کپشن نمودار + تاریخ آخرین آپدیت قیمت (EN — مقاوم به RTL)
-        f_cap = _font(22, "r")
-        if unit == "تومان":
-            cap = "14-day trend · updated: " + data.get("updated", "")
-        else:
-            cap = "24h trend (hourly) · live"
-        cd.text((cw // 2, y), cap, font=f_cap, fill=GRAY, anchor="mm")
-        y += 48
-
-    # 🔷 لوگوی بزرگ تون — وسط کارت، روی نمودار (شفاف، خفن)
-    if code == "TON" and _TON_LOGO_BIG is not None:
-        try:
-            _lg = _TON_LOGO_BIG.resize((440, 440), Image.LANCZOS)
-            _la2 = _lg.split()[3].point(lambda a: int(a * 0.62))
-            _lg.putalpha(_la2)
-            card.alpha_composite(_lg, (cw//2 - 220, ch//2 - 260))
-        except Exception as e_tlg:
-            log.warning("TON card logo: %s", e_tlg)
-
-    # ۱۹. نوار موقعیت ۲۴ ساعته (اگه high/low داریم) — در بنر ویدیویی نکش (ناحیه‌ی نمودار آزاد بمونه)
-    h24 = data.get("high_24")
-    l24 = data.get("low_24")
-    if h24 and l24 and h24 > l24 and not no_chart:
-        _draw_24h_range_bar(cd, 40, cw - 40, y, l24, h24, price, card_outline)
-        f_rl = _font(20, "b")
-        cd.text((cw // 2, y + 52), "Price position in 24h range",
-                font=f_rl, fill=GRAY, anchor="mm")
-        y += 84
-
-    # ---- ترکیب نهایی ----
-    out = base.convert("RGBA")
-    out.alpha_composite(card, (card_margin, 50))
-
-    od = ImageDraw.Draw(out)
-    # (بج منبع حذف شد — کاربر نخواست)
-
-    # ۸. لوگوی دایره‌ای گوشه‌ی پایین راست (بجای واترمارک متنی)
-    try:
-        logo_path = "assets/logo_circle.png"
-        if not os.path.exists(logo_path) and os.path.exists("logo_pro.png"):
-            lg = Image.open("logo_pro.png").convert("RGBA").resize((72, 72), Image.LANCZOS)
-            mask2 = Image.new("L", (72, 72), 0)
-            ImageDraw.Draw(mask2).ellipse((0, 0, 72, 72), fill=255)
-            lg.putalpha(mask2)
-            lg.save(logo_path)
-        if os.path.exists(logo_path):
-            lg = Image.open(logo_path).convert("RGBA")
-            out.paste(lg, (W - 100, H - 100), lg)
-    except Exception:
-        pass
-
-    # واترمارک متنی کنار لوگو
-    f_wm = _font(24, "b")
-    od.text((W - 115, H - 64), _rtl(_fa("AuroraPriceBot · @iprez")),
-            font=f_wm, fill=(230, 230, 235, 200), anchor="rm")
-
-    buf = io.BytesIO()
-    out.convert("RGB").save(buf, "PNG")
-    if no_chart:
-        # بنر ویدیویی کش نمی‌شه (موقته) — فقط برگرد
-        return buf.getvalue()
-    _PNG_CACHE[ck] = (now, buf.getvalue())
-    _cache_cap(_PNG_CACHE)
-    return _PNG_CACHE[ck][1]
+    return _ember_render_banner(code, ck, now, data, hist, no_chart=no_chart)

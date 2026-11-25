@@ -15,6 +15,8 @@ import catalog
 
 log = logging.getLogger("data")
 
+MARKET_MARGIN_PCT = 0.3  # حاشیه‌ی بازار (٪) روی دلار/تترِ والکس — قیمت خیابانی؛ به دستور مالک ۲۰۲۶-۱۱-۰۷، بازگردانده‌شده روی آپدیت ۲۰۲۶-۱۱-۲۵
+
 UA = {"User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Safari/537.36"}
 _cache = {}
 CACHE_TTL = 3  # کش خیلی کوتاه — قیمت واقعاً لایو (تغییرات سریع دیده بشه)
@@ -343,7 +345,7 @@ def get_banner_data(code: str) -> Optional[dict]:
         price = None
         pct = None
         if code == "dollar":
-            price = round(buy_p) if buy_p else None  # خام خرید — مثل تتر
+            price = round(buy_p * (1 + MARKET_MARGIN_PCT / 100.0)) if buy_p else None  # خرید + حاشیه‌ی بازار — مثل تتر
             pct = wallex_usdt_quote().get("ch")  # از کوتیشن واحد — بدون کال دوم
         elif fx_sym:
             rate = binance_fx_rate(fx_sym)
@@ -399,7 +401,7 @@ def get_banner_data(code: str) -> Optional[dict]:
         # فیلدهای dailyHighPrice/dailyLowPrice در coin-market-list خرابن (هر دو == wPrice)
         buy_p, ch = wallex_buy_quote()      # قیمت خرید لایو (۲۱۸k) — بدون سود اضافه
         otc = usdt_toman()                  # شاخص wPrice خام (۲۱۶k)
-        last = round(buy_p) if buy_p else None
+        last = round(buy_p * (1 + MARKET_MARGIN_PCT / 100.0)) if buy_p else None  # خرید + حاشیه‌ی بازار
         if last:
             high_24 = low_24 = None
             try:
