@@ -311,7 +311,7 @@ def get_last_video_price(code: str):
     return _LAST_VIDEO_PRICE.get(ck)
 
 
-def render_banner_video(code: str, duration: float = 3.0, fps: int = 24) -> Optional[bytes]:
+def render_banner_video(code: str, duration: float = 2.0, fps: int = 24) -> Optional[bytes]:
     """۵. نمودار متحرک MP4 — خط با انیمیشن کشیده می‌شه + نقطه‌ی pulse.
     خروجی bytes (mp4/h264). کش ۶۰ ثانیه. fallback: None → فراخوان از PNG استفاده کنه."""
     ck = catalog.resolve(code) or code
@@ -502,7 +502,7 @@ def _ember_write_segment(P: dict, f0: int, f1: int, n_frames: int, fps: int, pat
          "-s", f"{w}x{h}",
          "-pix_fmt", "rgb24", "-r", str(fps), "-i", "-",
          "-an", "-vcodec", "libx264", "-preset", "ultrafast", "-tune", "animation", "-threads", "1",
-         "-pix_fmt", "yuv420p", "-crf", "20", path],
+         "-pix_fmt", "yuv420p", "-crf", "24", path],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         for f in range(f0, f1):
@@ -615,7 +615,7 @@ def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps:
              "-pix_fmt", "rgb24", "-r", str(fps), "-i", "-",
              "-an", "-vcodec", "libx264", "-preset", "ultrafast", "-tune", "animation", "-threads", "1",
              "-pix_fmt", "yuv420p",
-             "-movflags", "+faststart", "-crf", "20", tmp.name],
+             "-movflags", "+faststart", "-crf", "24", tmp.name],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             for f in range(n_frames):
