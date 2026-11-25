@@ -121,7 +121,8 @@ async def _prefetch(ctx: ContextTypes.DEFAULT_TYPE, keys: list):
 
 
 # اولویت با پرتقاضاتره — warm loop زودتر نرم میکنه
-HOT_KEYS = ["dollar", "usdt", "euro", "BTC", "gold_18", "pound", "TON", "try", "aed", "SOL", "ETH"]
+HOT_KEYS = ["dollar", "usdt", "euro", "BTC", "gold_18", "pound", "TON", "try", "aed", "SOL", "ETH",
+            "coin_emami", "coin_gerami", "gold_24", "kwd", "chf", "XRP", "DOGE", "SHIB", "BNB"]
 
 
 async def _warm_loop(ctx: ContextTypes.DEFAULT_TYPE):

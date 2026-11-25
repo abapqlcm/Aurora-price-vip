@@ -343,11 +343,28 @@ def render_banner_video(code: str, duration: float = 3.0, fps: int = 24) -> Opti
             return None
 
 
-def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps: int, prefetched_data: dict | None = None) -> Optional[bytes]:
-    # FIX: use prefetched data if available to avoid duplicate HTTP call
-    data = prefetched_data if prefetched_data is not None else datafeeds.get_banner_data(code)
-    if not data or not data.get("price"):
+def _ember_base(code: str, ck: str):
+    """تصویر پایه‌ی Ember (بدون قیمت/نمودار) با کش — در والد صدا زده می‌شود تا
+    فرزندهای fork درگیر قفل رندر نشوند."""
+    _bkey = (ck, _asset_type(code))
+    _bhit = _VIDEO_BASE_CACHE.get(_bkey)
+    if _bhit is not None:
+        return _bhit.copy()
+    base_png = render_banner_base_no_chart(code, omit_price=True)
+    if not base_png:
         return None
+    base_img = Image.open(io.BytesIO(base_png)).convert("RGB")
+    if len(_VIDEO_BASE_CACHE) > 12:
+        keys_to_remove = list(_VIDEO_BASE_CACHE.keys())[:len(_VIDEO_BASE_CACHE) - 12]
+        for k in keys_to_remove:
+            del _VIDEO_BASE_CACHE[k]
+    _VIDEO_BASE_CACHE[_bkey] = base_img.copy()
+    return base_img
+
+
+def _ember_prep(code: str, ck: str, data: dict):
+    """آماده‌سازی مشترک رندر ویدیو: تاریخچه، پایه، لایه‌ها و نقاط نمودار.
+    خروجی: دیکشنری آماده‌ی فریم‌سازی یا None."""
     hist = data.get("history") or []
     # فالبک تاریخچه: TGJU گاهی 500 می‌ده → برای usdt/dollar اول کندل‌های والکس،
     # برای بقیه‌ی ارزها تاریخچه‌ی محلی خودشان (تاریخچه‌ی تتر برای دلار/تتر فقط)
@@ -364,39 +381,231 @@ def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps:
             hist = [data["price"] * 0.999, data["price"]]
     if len(hist) < 2:
         return None
-
     price = data["price"]
     pct = data.get("change_pct")
-
-    # پس‌زمینه‌ی Ember بدون قیمت/نمودار (از رندر استاتیک — کش پایه مثل قبل)
-    _bkey = (ck, _asset_type(code))
-    _bhit = _VIDEO_BASE_CACHE.get(_bkey)
-    if _bhit is not None:
-        base_img = _bhit.copy()
-    else:
-        base_png = render_banner_base_no_chart(code, omit_price=True)
-        if not base_png:
-            return None
-        base_img = Image.open(io.BytesIO(base_png)).convert("RGB")
-        if len(_VIDEO_BASE_CACHE) > 12:
-            keys_to_remove = list(_VIDEO_BASE_CACHE.keys())[:len(_VIDEO_BASE_CACHE) - 12]
-            for k in keys_to_remove:
-                del _VIDEO_BASE_CACHE[k]
-        _VIDEO_BASE_CACHE[_bkey] = base_img.copy()
+    base_img = _ember_base(code, ck)
+    if base_img is None:
+        return None
     Wv, Hv = base_img.size
-
-    # لایه‌های از پیش رندرشده‌ی Ember (گرادیان قیمت، چیپ، هاله‌ی خورشید، نقاط نمودار)
+    w, h = (Wv // 2) * 2, (Hv // 2) * 2
+    if (w, h) != (Wv, Hv):
+        base_img = base_img.crop((0, 0, w, h))
     grad = _ember_amber_grad()
     chip_layer = _ember_chip_layer(pct)
     glow = _ember_glow_layer()
     cx0, cy0, cx1, cy1 = _EMBER_CHART
     sm = _ember_smooth(hist, cx0, cy0, cx1, cy1)
     hi, lo, frac = _ember_range(data, hist)
+    # هاله‌ی خورشید در ۸ سطحِ تنفس از پیش داخل پایه پخته می‌شود (کامپوزیت کمتر)
+    bases = []
+    for _k in range(8):
+        _ga = glow.copy()
+        _av = 0.10 + 0.05 * (-1 + 2 * _k / 7)
+        _ga.putalpha(_ga.split()[3].point(lambda v: int(v * _av)))
+        bases.append(Image.alpha_composite(base_img.convert("RGBA"), _ga))
+    return {
+        "price": price, "pf": _ember_price_font(price), "bases": bases,
+        "grad": grad, "chip": chip_layer, "sm": sm, "frac": frac,
+        "chart": (cx0, cy0, cx1, cy1), "w": w, "h": h,
+    }
 
+
+def _ember_frame(P: dict, f: int, n_frames: int, fps: int):
+    """یک فریم کامل Ember (تصویر RGB) از روی prep."""
+    price = P["price"]
+    pf = P["pf"]
+    grad = P["grad"]
+    chip_layer = P["chip"]
+    sm = P["sm"]
+    frac = P["frac"]
+    cx0, cy0, cx1, cy1 = P["chart"]
+    t = f / max(1, n_frames - 1)
+    tsec = f / fps
+    _ph = math.sin(tsec * math.pi * 2 * 0.57)
+    img = P["bases"][int((_ph + 1) / 2 * 7.99)].copy()
+    # پیشرفت اصلی — یک محرک واحد برای قیمت + نمودار + نوار بازه (هم‌زمان، بدون عقب‌جلو)
+    mp = _ember_ease_io(_ember_clamp01((t - 0.06) / 0.56))
+    # قیمت — شمارش از صفر تا قیمت نهایی با گرادیان کهربایی
+    pv = price if t >= 0.64 else price * mp
+    pv_show = int(pv) if price >= 100 else pv
+    # کامپوزیت فقط روی نوار قیمت (نه تمام صفحه) — سریع‌تر
+    _band = (40, 230, 880, 430)
+    tm = Image.new("L", (_band[2] - _band[0], _band[3] - _band[1]), 0)
+    ImageDraw.Draw(tm).text((84 - _band[0], 266 - _band[1]), _fmt(pv_show), font=pf, fill=255)
+    _comp = Image.composite(grad.crop(_band), Image.new("RGBA", tm.size, (0, 0, 0, 0)), tm)
+    img.paste(_comp, (_band[0], _band[1]), _comp)
+    d = ImageDraw.Draw(img, "RGBA")
+    # نمودار — کشیده‌شدن هم‌زمان با قیمت
+    if mp > 0:
+        n = max(2, int(len(sm) * mp))
+        pts = sm[:n]
+        fa = int(46 * _ember_clamp01((t - 0.22) / 0.34))
+        if fa > 0:
+            # پرکردن نیمه‌شفاف فقط با لایه+کامپوزیت درست blend می‌شود (Pillow 10.4)
+            fl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            ImageDraw.Draw(fl).polygon(pts + [(pts[-1][0], cy1), (cx0, cy1)], fill=(255, 154, 60, fa))
+            img = Image.alpha_composite(img, fl)
+            d = ImageDraw.Draw(img, "RGBA")
+        d.line(pts, fill=(255, 154, 60, 90), width=7, joint="curve")
+        d.line(pts, fill=(255, 205, 140, 255), width=3, joint="curve")
+        ex, ey = pts[-1]
+        pulse = 0.5 + 0.5 * math.sin(tsec * math.pi * 4)
+        d.ellipse((ex - 10, ey - 10, ex + 10, ey + 10), fill=(255, 170, 90, int(40 + 40 * pulse)))
+        d.ellipse((ex - 5, ey - 5, ex + 5, ey + 5), fill=(255, 244, 224, 255))
+    # نوار بازه — لغزش یک‌طرفه از LOW تا جای واقعی قیمت (با همان mp)
+    if t >= 0.06:
+        mxp = 88 + (812 - 88) * (frac * mp)
+        d.rounded_rectangle((88, 746, mxp, 754), 4, fill=(255, 170, 60, 230))
+        d.ellipse((mxp - 9, 741, mxp + 9, 759), fill=(255, 244, 224, 255), outline=(255, 154, 60, 255), width=2)
+    # چیپ درصد — ورود نرم نزدیک پایان sweep
+    cp = _ember_clamp01((t - 0.60) / 0.14)
+    if cp > 0 and chip_layer is not None:
+        ch = chip_layer.copy()
+        ch.putalpha(ch.split()[3].point(lambda v: int(v * cp)))
+        img.paste(ch, (0, int((1 - cp) * 10)), ch)
+        d = ImageDraw.Draw(img, "RGBA")
+    # بج LIVE — چشمک واقعی روشن/خاموش (دوره‌ی ۱٫۲ ثانیه)
+    cyc = (tsec % 1.2) / 1.2
+    bright = 0.10 + 0.90 * ((0.5 + 0.5 * math.sin(cyc * math.pi * 2 - math.pi / 2)) ** 1.3)
+    def _lc(c0, c1, k):
+        return tuple(int(c0[i] + (c1[i] - c0[i]) * k) for i in range(3)) + (255,)
+    rr_ = 8 + 9 * cyc
+    d.ellipse((715 - rr_, 110 - rr_, 715 + rr_, 110 + rr_),
+              outline=_lc((96, 58, 26), (255, 170, 90), bright * (1 - cyc)), width=2)
+    d.ellipse((715 - 9, 110 - 9, 715 + 9, 110 + 9), fill=_lc((70, 42, 20), (150, 92, 40), bright))
+    d.ellipse((715 - 6, 110 - 6, 715 + 6, 110 + 6), fill=_lc((120, 70, 28), (255, 199, 116), bright))
+    # ذرات جرقه‌ی شناور — لایه + کامپوزیت (blend درست آلفا)
+    pov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    pd = ImageDraw.Draw(pov)
+    for p in _EMBER_PARTS:
+        py = (p["y"] - p["sp"] * tsec) % 950
+        px = p["x"] + math.sin(tsec * p["fq"] + p["ph"]) * p["amp"]
+        twk = 0.55 + 0.45 * math.sin(tsec * 2.2 + p["tw"])
+        rad = p["r"]
+        pd.ellipse((px - rad * 3, py - rad * 3, px + rad * 3, py + rad * 3), fill=p["col"] + (int(26 * twk),))
+        pd.ellipse((px - rad, py - rad, px + rad, py + rad), fill=p["col"] + (int(215 * twk),))
+    img = Image.alpha_composite(img, pov)
+    d = ImageDraw.Draw(img, "RGBA")
+    # حلقه‌ی سونار دور لوگو (چسبیده + موج ملایم)
+    sp_ = (tsec % 1.5) / 1.5
+    sr = 40 + 13 * sp_
+    d.ellipse((836 - sr, 886 - sr, 836 + sr, 886 + sr), outline=(255, 170, 90, int(110 * (1 - sp_))), width=2)
+    return img.convert("RGB")
+
+
+def _ember_write_segment(P: dict, f0: int, f1: int, n_frames: int, fps: int, path: str) -> bool:
+    """فریم‌های [f0, f1) را با ffmpeg جدا به یک سگمنت mp4 تبدیل می‌کند."""
     _FF = imageio_ffmpeg.get_ffmpeg_exe()
-    w, h = (Wv // 2) * 2, (Hv // 2) * 2
-    if (w, h) != (Wv, Hv):
-        base_img = base_img.crop((0, 0, w, h))
+    w, h = P["w"], P["h"]
+    proc = subprocess.Popen(
+        [_FF, "-y", "-threads", "1", "-f", "rawvideo", "-vcodec", "rawvideo",
+         "-s", f"{w}x{h}",
+         "-pix_fmt", "rgb24", "-r", str(fps), "-i", "-",
+         "-an", "-vcodec", "libx264", "-preset", "ultrafast", "-tune", "animation", "-threads", "1",
+         "-pix_fmt", "yuv420p", "-crf", "20", path],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        for f in range(f0, f1):
+            proc.stdin.write(_ember_frame(P, f, n_frames, fps).tobytes())
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    try:
+        proc.wait(timeout=60)
+    except Exception:
+        proc.kill()
+        proc.wait()
+        return False
+    return os.path.exists(path) and os.path.getsize(path) > 1000
+
+
+def _ember_segment_job(job):
+    """کار هر Process: prep مستقل + رندر سگمنت خودش (خطا = فایل ناقص → والد می‌فهمد)."""
+    code, ck, data, fps, f0, f1, n_frames, path = job
+    try:
+        P = _ember_prep(code, ck, data)
+        if P is None:
+            return
+        _ember_write_segment(P, f0, f1, n_frames, fps, path)
+    except Exception:
+        pass
+
+
+def _render_video_parallel(code: str, ck: str, data: dict, duration: float, fps: int, n_frames: int):
+    """رندر موازی روی ۲ هسته: دو Process، هرکدام نصف فریم‌ها + concat بدون ریکد.
+    هر خطایی → None تا مسیر سریال فالبک شود."""
+    import multiprocessing as _mp
+    # پایه را در والد آماده کن تا فرزندها درگیر قفل رندر نشوند (کش گرم ارث می‌رسد)
+    if _ember_base(code, ck) is None:
+        return None
+    mid = n_frames // 2
+    tmpd = tempfile.mkdtemp(prefix="ember_seg_")
+    seg1 = os.path.join(tmpd, "s1.mp4")
+    seg2 = os.path.join(tmpd, "s2.mp4")
+    outp = os.path.join(tmpd, "out.mp4")
+    lst = os.path.join(tmpd, "list.txt")
+    procs = []
+    try:
+        ctx = _mp.get_context("fork")
+        for (f0, f1, path) in ((0, mid, seg1), (mid, n_frames, seg2)):
+            p = ctx.Process(target=_ember_segment_job,
+                            args=((code, ck, data, fps, f0, f1, n_frames, path),))
+            p.start()
+            procs.append(p)
+        for p in procs:
+            p.join(timeout=45)
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=5)
+                return None
+        if not (os.path.exists(seg1) and os.path.getsize(seg1) > 1000
+                and os.path.exists(seg2) and os.path.getsize(seg2) > 1000):
+            return None
+        with open(lst, "w") as fh:
+            fh.write(f"file '{seg1}'\nfile '{seg2}'\n")
+        _FF = imageio_ffmpeg.get_ffmpeg_exe()
+        r = subprocess.run([_FF, "-y", "-f", "concat", "-safe", "0", "-i", lst,
+                            "-c", "copy", "-movflags", "+faststart", outp],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+        if r.returncode != 0 or not os.path.exists(outp) or os.path.getsize(outp) < 1000:
+            return None
+        return open(outp, "rb").read()
+    finally:
+        for p in procs:
+            try:
+                if p.is_alive():
+                    p.terminate()
+            except Exception:
+                pass
+        try:
+            import shutil as _sh
+            _sh.rmtree(tmpd, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps: int, prefetched_data: dict | None = None) -> Optional[bytes]:
+    # FIX: use prefetched data if available to avoid duplicate HTTP call
+    data = prefetched_data if prefetched_data is not None else datafeeds.get_banner_data(code)
+    if not data or not data.get("price"):
+        return None
+    n_frames = int(duration * fps)
+    # مسیر موازی ۲ هسته‌ای (فالبک خودکار به سریال)
+    if n_frames >= 24:
+        try:
+            out = _render_video_parallel(code, ck, data, duration, fps, n_frames)
+            if out:
+                _MP4_CACHE[ck] = (now, out)
+                _cache_cap(_MP4_CACHE)
+                return out
+        except Exception as e:
+            log.warning("parallel video render %s: %s", code, e)
+    P = _ember_prep(code, ck, data)
+    if P is None:
+        return None
+    _FF = imageio_ffmpeg.get_ffmpeg_exe()
+    w, h = P["w"], P["h"]
     tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     tmp.close()
     try:
@@ -409,89 +618,8 @@ def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps:
              "-movflags", "+faststart", "-crf", "20", tmp.name],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            n_frames = int(duration * fps)
-            pf = _ember_price_font(price)
-            # بهینه‌سازی سرعت (۲۰۲۶-۱۱-۲۵): هاله‌ی خورشید در ۸ سطحِ تنفس از پیش داخل
-            # پایه پخته می‌شود تا هر فریم کامپوزیت تمام‌صفحه نخواهد
-            _bases = []
-            for _k in range(8):
-                _ga = glow.copy()
-                _av = 0.10 + 0.05 * (-1 + 2 * _k / 7)
-                _ga.putalpha(_ga.split()[3].point(lambda v: int(v * _av)))
-                _bases.append(Image.alpha_composite(base_img.convert("RGBA"), _ga))
             for f in range(n_frames):
-                t = f / max(1, n_frames - 1)
-                tsec = f / fps
-                _ph = math.sin(tsec * math.pi * 2 * 0.57)
-                img = _bases[int((_ph + 1) / 2 * 7.99)].copy()
-                # پیشرفت اصلی — یک محرک واحد برای قیمت + نمودار + نوار بازه (هم‌زمان، بدون عقب‌جلو)
-                mp = _ember_ease_io(_ember_clamp01((t - 0.06) / 0.56))
-                # قیمت — شمارش از صفر تا قیمت نهایی با گرادیان کهربایی
-                pv = price if t >= 0.64 else price * mp
-                pv_show = int(pv) if price >= 100 else pv
-                # کامپوزیت فقط روی نوار قیمت (نه تمام صفحه) — سریع‌تر
-                _band = (40, 230, 880, 430)
-                tm = Image.new("L", (_band[2] - _band[0], _band[3] - _band[1]), 0)
-                ImageDraw.Draw(tm).text((84 - _band[0], 266 - _band[1]), _fmt(pv_show), font=pf, fill=255)
-                _comp = Image.composite(grad.crop(_band), Image.new("RGBA", tm.size, (0, 0, 0, 0)), tm)
-                img.paste(_comp, (_band[0], _band[1]), _comp)
-                d = ImageDraw.Draw(img, "RGBA")
-                # نمودار — کشیده‌شدن هم‌زمان با قیمت
-                if mp > 0:
-                    n = max(2, int(len(sm) * mp))
-                    pts = sm[:n]
-                    fa = int(46 * _ember_clamp01((t - 0.22) / 0.34))
-                    if fa > 0:
-                        # پرکردن نیمه‌شفاف فقط با لایه+کامپوزیت درست blend می‌شود (Pillow 10.4)
-                        fl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-                        ImageDraw.Draw(fl).polygon(pts + [(pts[-1][0], cy1), (cx0, cy1)], fill=(255, 154, 60, fa))
-                        img = Image.alpha_composite(img, fl)
-                        d = ImageDraw.Draw(img, "RGBA")
-                    d.line(pts, fill=(255, 154, 60, 90), width=7, joint="curve")
-                    d.line(pts, fill=(255, 205, 140, 255), width=3, joint="curve")
-                    ex, ey = pts[-1]
-                    pulse = 0.5 + 0.5 * math.sin(tsec * math.pi * 4)
-                    d.ellipse((ex - 10, ey - 10, ex + 10, ey + 10), fill=(255, 170, 90, int(40 + 40 * pulse)))
-                    d.ellipse((ex - 5, ey - 5, ex + 5, ey + 5), fill=(255, 244, 224, 255))
-                # نوار بازه — لغزش یک‌طرفه از LOW تا جای واقعی قیمت (با همان mp)
-                if t >= 0.06:
-                    mxp = 88 + (812 - 88) * (frac * mp)
-                    d.rounded_rectangle((88, 746, mxp, 754), 4, fill=(255, 170, 60, 230))
-                    d.ellipse((mxp - 9, 741, mxp + 9, 759), fill=(255, 244, 224, 255), outline=(255, 154, 60, 255), width=2)
-                # چیپ درصد — ورود نرم نزدیک پایان sweep
-                cp = _ember_clamp01((t - 0.60) / 0.14)
-                if cp > 0 and chip_layer is not None:
-                    ch = chip_layer.copy()
-                    ch.putalpha(ch.split()[3].point(lambda v: int(v * cp)))
-                    img.paste(ch, (0, int((1 - cp) * 10)), ch)
-                    d = ImageDraw.Draw(img, "RGBA")
-                # بج LIVE — چشمک واقعی روشن/خاموش (دوره‌ی ۱٫۲ ثانیه)
-                cyc = (tsec % 1.2) / 1.2
-                bright = 0.10 + 0.90 * ((0.5 + 0.5 * math.sin(cyc * math.pi * 2 - math.pi / 2)) ** 1.3)
-                def _lc(c0, c1, k):
-                    return tuple(int(c0[i] + (c1[i] - c0[i]) * k) for i in range(3)) + (255,)
-                rr_ = 8 + 9 * cyc
-                d.ellipse((715 - rr_, 110 - rr_, 715 + rr_, 110 + rr_),
-                          outline=_lc((96, 58, 26), (255, 170, 90), bright * (1 - cyc)), width=2)
-                d.ellipse((715 - 9, 110 - 9, 715 + 9, 110 + 9), fill=_lc((70, 42, 20), (150, 92, 40), bright))
-                d.ellipse((715 - 6, 110 - 6, 715 + 6, 110 + 6), fill=_lc((120, 70, 28), (255, 199, 116), bright))
-                # ذرات جرقه‌ی شناور — لایه + کامپوزیت (blend درست آلفا)
-                pov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-                pd = ImageDraw.Draw(pov)
-                for p in _EMBER_PARTS:
-                    py = (p["y"] - p["sp"] * tsec) % 950
-                    px = p["x"] + math.sin(tsec * p["fq"] + p["ph"]) * p["amp"]
-                    twk = 0.55 + 0.45 * math.sin(tsec * 2.2 + p["tw"])
-                    rad = p["r"]
-                    pd.ellipse((px - rad * 3, py - rad * 3, px + rad * 3, py + rad * 3), fill=p["col"] + (int(26 * twk),))
-                    pd.ellipse((px - rad, py - rad, px + rad, py + rad), fill=p["col"] + (int(215 * twk),))
-                img = Image.alpha_composite(img, pov)
-                d = ImageDraw.Draw(img, "RGBA")
-                # حلقه‌ی سونار دور لوگو (چسبیده + موج ملایم)
-                sp_ = (tsec % 1.5) / 1.5
-                sr = 40 + 13 * sp_
-                d.ellipse((836 - sr, 886 - sr, 836 + sr, 886 + sr), outline=(255, 170, 90, int(110 * (1 - sp_))), width=2)
-                proc.stdin.write(img.convert("RGB").tobytes())
+                proc.stdin.write(_ember_frame(P, f, n_frames, fps).tobytes())
             proc.stdin.close()
         except BrokenPipeError:
             pass
@@ -514,7 +642,6 @@ def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps:
     _MP4_CACHE[ck] = (now, out)
     _cache_cap(_MP4_CACHE)
     return out
-
 
 
 def _code_ids(code: str):
