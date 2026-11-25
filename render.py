@@ -46,7 +46,8 @@ EXTRA = {
     "بیت کوین": "BTC", "بیتکوین": "BTC", "btc": "BTC", "بیت": "BTC",
     "اتریوم": "ETH", "eth": "ETH", "اتری": "ETH",
     "سولانا": "SOL", "sol": "SOL",
-    "تون": "TON", "ton": "TON", "تونکوین": "TON", "گرم تون": "TON", "گرام": "TON",
+    "تون": "TON", "ton": "TON", "تونکوین": "TON", "گرم تون": "TON",
+    "گرم": "gold_18", "گرام": "gold_18",
     "دوج": "DOGE", "دوجکوین": "DOGE", "doge": "DOGE",
     "شیبا": "SHIB", "shib": "SHIB",
     "ریپل": "XRP", "xrp": "XRP",
@@ -114,11 +115,14 @@ EXTRA = {
 }
 FA_TO_KEY.update(EXTRA)
 
-# حذف کلمات اضافه از ورودی
-STOP = re.compile(r"\b(به|چند|چنده|قیمت|چی|هست|میشه|می‌شه|روی|از|با|در|برای|؟)\b")
+# حذف کلمات اضافه از ورودی — علائم نگارشی (؟ ? ، .) جداگانه حذف می‌شن،
+# چون \b قبل/بعد از «؟» مرز کلمه تشکیل نمی‌ده و STOP هیچ‌وقت با «؟» مچ نمی‌شه
+_PUNCT = re.compile(r"[؟?،.]+")
+STOP = re.compile(r"\b(به|چند|چنده|قیمت|چی|هست|میشه|می‌شه|روی|از|با|در|برای)\b")
 
 
 def _clean(s: str) -> str:
+    s = _PUNCT.sub(" ", s)
     s = STOP.sub("", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -127,7 +131,10 @@ def _clean(s: str) -> str:
 def _to_en_digits(s: str) -> str:
     """تبدیل اعداد فارسی/عربی به انگلیسی + علائم نگارشی فارسی (، ٫)."""
     s = s.translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"))
-    return s.replace("٬", ",").replace("،", ",").replace("٫", ".")
+    s = s.replace("٬", ",").replace("،", ",").replace("٫", ".")
+    # جداکننده هزارگان بین ارقام حذف بشه تا «1,000,000» یه توکن عددی بمونه
+    s = re.sub(r"(?<=\d)[,،](?=\d{3}\b)", "", s)
+    return s
 
 
 # نرمال‌سازی کلیدهای فارسی: اعداد فارسی/کامای فارسی داخل کلیدها رو به انگلیسی تبدیل کن
@@ -146,10 +153,12 @@ def parse_input(text: str) -> Tuple[Optional[str], Any]:
     tc_clean = _clean(tc)
 
     # فقط پیام‌های کوتاه و مستقیم قبول کن (جلوگیری از گیجی در گپ)
+    # گیت روی متن پاک‌شده — نه خام؛ وگرنه «قیمت بیت کوین چنده» (۴ کلمه‌ی خام)
+    # با وجود کلید معتبر رد می‌شه
     # 1) عدد + ارز: "125 دلار"
     # 2) تک ارز: "دلار"
     # 3) اسم کامل: "پوند انگلیس"
-    words = tc.split()
+    words = tc_clean.split()
     if len(words) > 3:
         return (None, None)  # جمله طولانی → خاموش
 
@@ -204,12 +213,14 @@ def _resolve_text(t: str):
 def fmt_num(v) -> str:
     """BUG-3: دقت داینامیک — قیمت‌های خیلی کوچک تا 10 رقم معنادار.
     BUG-30 فیکس: str اعشاری (مثل «1.27» از _nice) → ValueError نمی‌ده."""
+    if v is None:
+        return "—"
     if isinstance(v, str):
         try:
             v = float(v)
         except ValueError:
             return v
-    if isinstance(v, float) and 0 < v < 0.01:
+    if isinstance(v, float) and abs(v) < 0.01:
         return f"{v:,.10f}".rstrip("0").rstrip(".")
     if isinstance(v, float) and v < 10:
         return f"{v:,.6f}".rstrip("0").rstrip(".")

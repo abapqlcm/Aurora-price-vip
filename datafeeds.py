@@ -80,7 +80,7 @@ def tgju_history(tgju_id: str, days: int = 14) -> List[float]:
             r = _get(f"https://api.tgju.org/v1/market/indicator/summary-table-data/{tgju_id}", timeout=15)
             data = r.json().get("data", [])
             if not data:
-                _hist_cache[key] = (_t.time(), [])
+                _hist_cache[key] = (time.time(), [])
                 return []
             rows = data[:days]
             closes = []
@@ -257,21 +257,29 @@ def binance_fx_rate(usd_pair: str) -> Optional[float]:
 _fx_rates_cache = {"t": 0, "rates": {}}
 
 def erapi_rates() -> dict:
-    """نرخ جهانی همه‌ی ارزها نسبت به دلار — کش 10 دقیقه."""
+    """نرخ جهانی همه‌ی ارزها نسبت به دلار — کش 10 دقیقه.
+    خطا هم کش منفی ~90s می‌شه و در این فاصله کش قدیمی (حتی stale) سرو می‌شه."""
     now = time.time()
-    if _fx_rates_cache["rates"] and now - _fx_rates_cache["t"] < 600:
+    have = bool(_fx_rates_cache["rates"])
+    if have and now - _fx_rates_cache["t"] < 600:
         return _fx_rates_cache["rates"]
+    # کش منفی: بعد از خطا ~90 ثانیه دوباره تلاش نکن
+    if now - _fx_rates_cache["t"] < 90 and not have:
+        return {}
     try:
         r = _get("https://open.er-api.com/v6/latest/USD", timeout=12)
         rates = r.json().get("rates", {})
         if rates:
             _fx_rates_cache["t"] = now
             _fx_rates_cache["rates"] = rates
-        return rates
+            return rates
+        # پاسخ بدون rates → مثل خطا رفتار کن (ت timestamp برای کش منفی)
+        _fx_rates_cache["t"] = now
     except Exception as e:
         log.warning("erapi: %s", e)
-        # بازگشت کش قدیمی حتی اگر خالی باشد (جلوگیری از کرش در fx_to_usd)
-        return _fx_rates_cache["rates"] if _fx_rates_cache["rates"] else {}
+        _fx_rates_cache["t"] = now
+    # بازگشت کش قدیمی حتی اگر stale باشد (جلوگیری از کرش در fx_to_usd)
+    return _fx_rates_cache["rates"]
 
 
 def fx_to_usd(ccy: str) -> Optional[float]:
@@ -285,14 +293,37 @@ def fx_to_usd(ccy: str) -> Optional[float]:
 
 # ---------------- واحد یکپارچه ----------------
 
-# کد داخلی → کد ISO واقعی برای er-api
+# کد داخلی → کد ISO واقعی برای er-api — فقط وقتی نام er-api با code.upper() فرق داره
+# بقیه‌ی کدها مستقیم با code.upper() از rates خونده می‌شن (er-api 160+ کد داره)
 _FIAT_ISO = {
-    "dollar": "USD", "euro": "EUR", "pound": "GBP",
-    "aed": "AED", "try": "TRY", "chf": "CHF", "cad": "CAD", "aud": "AUD",
-    "cny": "CNY", "jpy": "JPY", "rub": "RUB", "kwd": "KWD", "sar": "SAR",
-    "omr": "OMR", "qar": "QAR", "bhd": "BHD", "inr": "INR", "pkr": "PKR",
-    "myr": "MYR", "iqd": "IQD",
+    "dollar": "USD",  # کد داخلی اسم کامل داره، نه ISO
+    "euro": "EUR",    # euro.upper() = EURO — کد er-api نیست
+    "pound": "GBP",   # pound.upper() = POUND — کد er-api نیست
+    "sdp": "SDD",     # پوند سودان — audit: er-api کد SDD. اما لایو er-api فقط SDG داره (166 کد)
 }
+
+
+def _fiat_iso(code: str) -> str:
+    """کد ISO er-api برای کد داخلی — upper() پیش‌فرض، نگاشت صریح فقط برای استثناها."""
+    return _FIAT_ISO.get(code) or code.upper()
+
+
+def _fx_pct_from_binance(code: str, iso: str) -> Optional[float]:
+    """درصد تغییر 24h ارز غیردلاری: نرخ جفت بایننس (مثل EURUSDT) الان vs ۲۴ ساعت قبل.
+    اگر بایننس جفت نداشت یا خطا خورد → None (کپشن نباید +0.00% الکی چاپ کنه)."""
+    try:
+        pair = f"{iso}USDT"
+        now_rate = binance_fx_rate(pair)
+        ohlcv = binance_ohlcv(pair, "1h", 25) if now_rate else []
+        if not now_rate or not ohlcv:
+            return None
+        p_24 = ohlcv[0][3]  # close قدیمی‌ترین کندل از ۲۵ کندل ساعتی (~24 ساعت)
+        if not p_24 or p_24 == 0:
+            return None
+        return round((now_rate - p_24) / p_24 * 100, 2)
+    except Exception as e:
+        log.warning("fiat 24h pct %s: %s", code, e)
+        return None
 
 
 def get_banner_data(code: str) -> Optional[dict]:
@@ -320,15 +351,19 @@ def get_banner_data(code: str) -> Optional[dict]:
                 price = round(usdt_t * rate)
             else:
                 # بایننس جفت نداشت → er-api
-                iso = _FIAT_ISO.get(code)
-                v = fx_to_usd(iso) if iso else None
+                v = fx_to_usd(_fiat_iso(code))
                 if usdt_t and v:
                     price = round(usdt_t * v)
         else:
-            iso = _FIAT_ISO.get(code)
-            v = fx_to_usd(iso) if iso else None
+            v = fx_to_usd(_fiat_iso(code))
             if usdt_t and v:
                 price = round(usdt_t * v)
+            else:
+                v = None
+        # تغییر ۲۴h ارزهای غیردلاری — نرخ جهانی الان vs ۲۴ ساعت قبل (بایننس)
+        # اگر در دسترس نبود None می‌مونه (فالبک TGJU dp خودش رو داره)
+        if code != "dollar" and price is not None and pct is None:
+            pct = _fx_pct_from_binance(code, _fiat_iso(code))
         if price is None:
             # فالبک نهایی: TGJU
             p, dp, d = tgju_quote(tg_id)
@@ -360,54 +395,44 @@ def get_banner_data(code: str) -> Optional[dict]:
     if code in catalog.STABLE:
         name, tg_id, _ = catalog.STABLE[code]
         # تتر = قیمت «خرید ارز» والکس (price — لایو، همون عددی که کاربر تو بخش خرید میبینه)
-        # + شاخص wPrice و های/لو ۲۴h خام برای کپشن
+        # ⚠️ های/لو ۲۴h همیشه از v1/markets (24h_highPrice/24h_lowPrice) میاد —
+        # فیلدهای dailyHighPrice/dailyLowPrice در coin-market-list خرابن (هر دو == wPrice)
         buy_p, ch = wallex_buy_quote()      # قیمت خرید لایو (۲۱۸k) — بدون سود اضافه
         otc = usdt_toman()                  # شاخص wPrice خام (۲۱۶k)
-        hi_i, lo_i = wallex_index_high_low()
         last = round(buy_p) if buy_p else None
-        if last and hi_i and lo_i:
-            high_24, low_24 = round(hi_i), round(lo_i)  # خام — بدون سود
-            ohlcv = [
-                [low_24, high_24, low_24, low_24],
-                [low_24, high_24, low_24, last],
-                [last, high_24, low_24, last]
-            ]
-            return {
-                "name": name, "price": last, "change_pct": ch,
-                "change_abs": None,
-                "high_24": high_24, "low_24": low_24,
-                "index_price": otc,  # شاخص wPrice — برای کپشن (تفاوت با خرید)
-                "history": [x / 10 for x in tgju_history(tg_id)],
-                "ohlcv": ohlcv,
-                "unit": "تومان", "source": "Wallex خرید (لایو)",
-            }
         if last:
-            # از همان quote کشدار high/low بگیر (بدون درخواست تکراری)
+            high_24 = low_24 = None
             try:
                 syms = _wallex_markets()
-                usdt_data = syms.get('USDTTMN', {})
-                stats = usdt_data.get('stats', {})
+                stats = syms.get('USDTTMN', {}).get('stats', {})
                 # های/لو ۲۴h خام والکس — بدون سود ۰.۵٪ (همون که سایت wallex.ir نشون میده)
-                high_24 = round(float(stats.get('24h_highPrice', last))) if stats.get('24h_highPrice') else last
-                low_24 = round(float(stats.get('24h_lowPrice', last))) if stats.get('24h_lowPrice') else last
-                # fake ohlcv برای chart — ساختار [open, high, low, close] مثل بایننس
+                if stats.get('24h_highPrice'):
+                    high_24 = round(float(stats['24h_highPrice']))
+                if stats.get('24h_lowPrice'):
+                    low_24 = round(float(stats['24h_lowPrice']))
+            except Exception as e:
+                log.warning("wallex USDTTMN stats: %s", e)
+            if high_24 is None or low_24 is None:
+                # فالبک: markets در دسترس نبود → کوتیشن واحد (رفتار قدیمی)
+                hi_i, lo_i = wallex_index_high_low()
+                high_24 = round(hi_i) if hi_i else last
+                low_24 = round(lo_i) if lo_i else last
+            # fake ohlcv برای chart — ساختار [open, high, low, close]؛ فقط وقتی hi>lo معناداره
+            ohlcv = []
+            if high_24 > low_24:
                 ohlcv = [
                     [low_24, high_24, low_24, low_24],
                     [low_24, high_24, low_24, last],
                     [last, high_24, low_24, last]
                 ]
-            except Exception as e:
-                log.warning("wallex USDTTMN stats: %s", e)
-                high_24 = low_24 = last
-                ohlcv = []
-
             return {
-                "name": name, "price": round(last), "change_pct": ch,
+                "name": name, "price": last, "change_pct": ch,
                 "change_abs": None,
-                "high_24": high_24, "low_24": low_24,  # ۱۷. برای نوار موقعیت ۲۴س
+                "high_24": high_24, "low_24": low_24,  # برای نوار موقعیت ۲۴س
+                "index_price": otc,  # شاخص wPrice — برای کپشن (تفاوت با خرید)
                 "history": [x / 10 for x in tgju_history(tg_id)],
                 "ohlcv": ohlcv,
-                "unit": "تومان", "source": "Wallex (لایو)",
+                "unit": "تومان", "source": "Wallex خرید (لایو)",
             }
         # fallback
         p, dp, d = tgju_quote(tg_id)
@@ -425,10 +450,14 @@ def get_banner_data(code: str) -> Optional[dict]:
             return None
         klines = [c[3] for c in ohlcv]
         price_usd = klines[-1]
-        # ۲۸. سرعت: pct از خود کندل‌ها (کندل ۲۴h قبل) — بدون درخواست دوم به Binance
-        p_24 = klines[-25] if len(klines) >= 25 else klines[0]
-        # محاسبه تغییرات ۲۴ ساعته با جلوگیری از تقسیم بر صفر
-        pct = round((price_usd - p_24) / p_24 * 100, 2) if p_24 and p_24 != 0 else None
+        # تغییر ۲۴h واقعی — از ticker/24hr بایننس (priceChangePercent؛ کندل ۲۵ در 15m فقط ۶ ساعت بود)
+        pct = binance_24h_change(sym)
+        if pct is None:
+            # فالبک: کندل ۲۴h قبل از خود کندل‌ها (۹۶ کندل ۱۵m = ۲۴ ساعت → ایندکس -97)
+            p_24 = klines[-97] if len(klines) >= 97 else klines[0]
+            pct = round((price_usd - p_24) / p_24 * 100, 2) if p_24 and p_24 != 0 else None
+        else:
+            p_24 = price_usd / (1 + pct / 100) if pct != -100 else 0.0
         # تاریخچه‌ی ۲۴h به تومان تبدیل می‌کنیم (دلار × تتر داخلی) تا همه چیز تومانی باشه؟
         # نه — کریپتو را دلاری نشان می‌دهیم، استانداردتر است
         ch_abs = price_usd - p_24 if p_24 else 0.0
@@ -493,12 +522,17 @@ def _hist_path(key: str) -> str:
     return _os.path.join(HIST_DIR, f"{safe}.json")
 
 
+_last_snap_ts: dict = {}  # code → آخرین ts ثبت‌شده — skip بدون خواندن فایل
+
+
 def record_snapshot(code: str, tgju_id: str = None, binance_sym: str = None):
     """قیمت لحظه‌ای را در تاریخچه‌ی محلی ثبت می‌کند — هر بار که بنر خواسته شه."""
-    # ۱۱. جلوگیری از ثبت تکراری در <55 ثانیه (warm loop نباید history رو شلوغ کنه)
+    # ۱۱. جلوگیری از ثبت تکراری در <55 ثانیه — با کش in-memory (بدون I/O)
+    now = int(time.time())
+    if now - _last_snap_ts.get(code, 0) < 55:
+        return
     path = _hist_path(f"local_{code}")
     try:
-        now = int(time.time())
         data = []
         if _os.path.exists(path):
             try:
@@ -506,8 +540,9 @@ def record_snapshot(code: str, tgju_id: str = None, binance_sym: str = None):
                     data = _json.load(f)
             except Exception:
                 data = []
-        # اگه آخرین snapshot تازه‌ست (<55s)، ثبت نکن (بدون duplicate و بدون fetch اضافه)
+        # اگه آخرین snapshot فایل تازه‌ست (<55s) — مثلاً بعد از ری‌استارت پروسه
         if data and now - data[-1][0] < 55:
+            _last_snap_ts[code] = data[-1][0]
             return
         price = None
         if not tgju_id and not binance_sym:
@@ -526,8 +561,12 @@ def record_snapshot(code: str, tgju_id: str = None, binance_sym: str = None):
         data.append([now, price])
         # حذف نقاط قدیمی‌تر از ۶۰ نقطه یا ۲۴ ساعت
         data = [x for x in data if now - x[0] < 86400][-60:]
-        with open(path, "w") as f:
+        # نوشتن اتمیک — tmp + replace تا فایل نصفه‌نیمه باقی نمونه
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
             _json.dump(data, f)
+        _os.replace(tmp, path)
+        _last_snap_ts[code] = now
     except Exception as e:
         log.warning("record_snapshot %s: %s", code, e)
 

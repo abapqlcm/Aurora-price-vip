@@ -135,7 +135,7 @@ CRYPTO = {
     "MANA": ("دیسنترالند", "MANAUSDT", "mana"),
     "AXS":  ("اکسی اینفینیتی","AXSUSDT","axs"),
     "APT":  ("آپتوس",      "APTUSDT",  "apt"),
-    "TON":  ("گرم",        "GRAMUSDT",  "gram"),
+    "TON":  ("تونکوین",     "GRAMUSDT",  "gram"),
 }
 
 # آیکون‌های ویژه‌ی طلا/سکه/تتر که لوگوی رمزارزی ندارن → ایموجی بزرگ می‌کشیم
@@ -151,7 +151,13 @@ ALIASES = {
     "دینار": "kwd", "فرانک": "chf", "ریال سعودی": "sar", "عربستان": "sar",
     "بیت": "BTC", "اتری": "ETH", "atom coin": "ATOM",
     "grams": "gold_18", "gram": "gold_18",
+    "گرم": "TON",  # نام نمایشی تون‌کوین عوض شد؛ این آلیاس مسیر ورودی را حفظ می‌کند
 }
+
+# نمادهای کریپتو با حروف کوچک هم resolve بشن (btc → BTC، ton → TON، ...)
+# هماهنگ با FA_TO_KEY رندر که کد lowercase رو هم ثبت می‌کنه
+for _c in CRYPTO:
+    ALIASES.setdefault(_c.lower(), _c)
 
 
 def resolve(code: str) -> Optional[str]:

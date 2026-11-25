@@ -122,9 +122,6 @@ async def _prefetch(ctx: ContextTypes.DEFAULT_TYPE, keys: list):
 # اولویت با پرتقاضاتره — warm loop زودتر نرم میکنه
 HOT_KEYS = ["dollar", "usdt", "euro", "BTC", "gold_18", "pound", "TON", "try", "aed", "SOL", "ETH"]
 
-# ۱۲. قفل کلی برای دسترسی‌های هم‌زمان به کش‌ها/فایل‌ها (thread-safe)
-_warm_lock = threading.Lock()
-
 
 async def _warm_loop(ctx: ContextTypes.DEFAULT_TYPE):
     """هر ۴ ثانیه ۳ ارز محبوب رو موازی رندر می‌کنه — دوره کامل ۱۵s بجای ۴۴s.
@@ -212,7 +209,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 # ۲۶. قیمت مچ: قیمتِ لحظه‌ی رندر ویدیو (کپشن = بنر، بدون مغایرت)
                 v_price = banner.get_last_video_price(key)
                 # ۲۹. کریپتو: قیمت تومانی هم تو کپشن (تتر تومانی × قیمت دلاری)
-                _toman = datafeeds.usdt_toman() if d0 and d0.get("unit") != "تومان" else None
+                # fetch در thread جدا — event loop بلاک نشه
+                _toman = (await loop.run_in_executor(None, datafeeds.usdt_toman)) if d0 and d0.get("unit") != "تومان" else None
                 # ۲۳. حالت GIF: reply_animation — اتوپلی + لوپ بی‌نهایت (بدون دکمه‌ی پخش)
                 # نکته: با bytes خام باید filename بدیم وگرنه تلگرام application/octet-stream نشون می‌ده!
                 try:
@@ -264,9 +262,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 total = amount * price
                 # BUG-2 فیکس: کریپتوی کوچک (SHIB) قبلاً «$0» می‌شد → دقت داینامیک
                 if key == "TON":
-                    # محاسبه تومانی برای تون
-                    toman_price = datafeeds.usdt_toman() or 0
-                    total_toman = amount * price * toman_price
+                    # محاسبه تومانی برای تون (fetch در thread جدا — event loop بلاک نشه)
+                    toman_price = (await loop.run_in_executor(None, datafeeds.usdt_toman)) or 0
                     cap = (
                         f"⭐️ 1 {d['name']} = <b>${render.fmt_num(price)}</b>\n"
                         f"≈ <b>{render.fmt_num(int(round(price * toman_price)))} تومان</b>\n"
@@ -309,9 +306,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     price = d.get("price") or 0
                     total = amount * price
                     if key == "TON":
-                        # محاسبه تومانی برای تون
-                        toman_price = datafeeds.usdt_toman() or 0
-                        total_toman = amount * price * toman_price
+                        # محاسبه تومانی برای تون (fetch در thread جدا — event loop بلاک نشه)
+                        toman_price = (await loop.run_in_executor(None, datafeeds.usdt_toman)) or 0
                         cap = (
                             f"⭐️ 1 {d['name']} = <b>${render.fmt_num(price)}</b>\n"
                             f"≈ <b>{render.fmt_num(int(round(price * toman_price)))} تومان</b>\n"
@@ -436,14 +432,23 @@ async def send_price_card(update_or_query, key: str, edit=False):
     if not d:
         msg = f"❌ نتونستم قیمت {key} رو بگیرم."
         if edit and hasattr(update_or_query, "edit_message_text"):
-            await update_or_query.edit_message_text(msg)
+            # پیام ممکنه مدیا باشه (عکس/گیف) — edit_message_text خطای BadRequest می‌ده → کپشن رو ویرایش کن
+            try:
+                await update_or_query.edit_message_text(msg)
+            except Exception as e_txt:
+                log.warning("edit_message_text failed (%s) → edit_message_caption", e_txt)
+                try:
+                    await update_or_query.edit_message_caption(caption=msg)
+                except Exception as e_cap:
+                    log.warning("edit_message_caption failed (%s) → new msg", e_cap)
         else:
             await update_or_query.message.reply_text(msg)
         return
     # ۲۶. قیمت مچ: کپشن = قیمتِ لحظه‌ی رندر ویدیو
     v_price = banner.get_last_video_price(key)
     # ۲۹. کریپتو: قیمت تومانی هم تو کپشن
-    _toman = datafeeds.usdt_toman() if d.get("unit") != "تومان" else None
+    # fetch در thread جدا — event loop بلاک نشه
+    _toman = (await loop.run_in_executor(None, datafeeds.usdt_toman)) if d.get("unit") != "تومان" else None
     cap = _caption_for(key, d, price_override=v_price, toman=_toman)
     kb = _carousel_kb(key)
     if vid:
@@ -481,7 +486,15 @@ async def send_price_card(update_or_query, key: str, edit=False):
     if not png:
         msg = f"❌ نتونستم قیمت {key} رو بگیرم."
         if edit and hasattr(update_or_query, "edit_message_text"):
-            await update_or_query.edit_message_text(msg)
+            # پیام ممکنه مدیا باشه (عکس/گیف) — edit_message_text خطای BadRequest می‌ده → کپشن رو ویرایش کن
+            try:
+                await update_or_query.edit_message_text(msg)
+            except Exception as e_txt:
+                log.warning("edit_message_text failed (%s) → edit_message_caption", e_txt)
+                try:
+                    await update_or_query.edit_message_caption(caption=msg)
+                except Exception as e_cap:
+                    log.warning("edit_message_caption failed (%s) → new msg", e_cap)
         else:
             await update_or_query.message.reply_text(msg)
         return
@@ -647,7 +660,11 @@ async def _admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query, data:
         loop = asyncio.get_running_loop()
         tg = await loop.run_in_executor(None, _ping)
         try:
-            du = subprocess.run(["sh", "-c", "du -sh hist 2>/dev/null | cut -f1"], capture_output=True, text=True, timeout=10).stdout.strip()
+            # du در thread جدا — event loop بلاک نشه (مثل /ping)
+            du = (await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(["sh", "-c", "du -sh hist 2>/dev/null | cut -f1"], capture_output=True, text=True, timeout=10).stdout.strip(),
+            ))
         except Exception:
             du = "?"
         try:
@@ -710,18 +727,25 @@ async def on_broadcast_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     with _BC_STATE_LOCK:
         if not _BC_STATE.get(uid):
             return False
-        _BC_STATE.pop(uid, None)
+        # state تا آخر حلقه نگه داشته می‌شه — هر دور با فعال بودنش چک می‌شه (قابل لغو وسط کار)
+    owner_id = uid  # قبل از حلقه ذخیره بشه — متغیر uid تو حلقه روی id هر کاربر overrule می‌شه
     msg = update.message
     targets = admin.all_user_ids()
     ok = fail = 0
     status = await msg.reply_text(f"📢 در حال ارسال به {len(targets)} کاربر...")
     for uid in targets:
+        # 🛑 لغو وسط کار: اگه ادمین /cancel_bc زده باشه یا «انصراف»، state خالی می‌شه → حلقه می‌ایسته
+        with _BC_STATE_LOCK:
+            if not _BC_STATE.get(owner_id):
+                break
         try:
             await ctx.bot.copy_message(chat_id=int(uid), from_chat_id=msg.chat_id, message_id=msg.message_id)
             ok += 1
         except Exception:
             fail += 1
         await asyncio.sleep(0.05)  # rate-limit
+    with _BC_STATE_LOCK:
+        _BC_STATE.pop(owner_id, None)
     await status.edit_text(f"📢 تمام شد!\n✅ موفق: {ok}\n❌ ناموفق: {fail}")
     return True
 
@@ -740,10 +764,6 @@ async def on_cancel_bc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """شروع ربات."""
-    if not TOKEN:
-        print("❌ BOT_TOKEN ست نشده.")
-        raise SystemExit(1)
-
     app = Application.builder().token(TOKEN).post_init(_post_init).concurrent_updates(True).build()
 
     # Handlers

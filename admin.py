@@ -18,10 +18,16 @@ USERS_FILE = os.path.join(DATA_DIR, "_stats_users.json")
 GROUPS_FILE = os.path.join(DATA_DIR, "_stats_groups.json")
 DAILY_FILE = os.path.join(DATA_DIR, "_stats_daily.json")
 
-_lock = threading.Lock()
+_lock = threading.RLock()  # RLock — track_user خودش lock رو گرفته و _save_debounced هم دوباره می‌گیره
 _users: dict = {}
 _groups: dict = {}
 _daily: dict = {}
+
+# debounce ذخیره: به‌جای یک بار نوشتن فایل به ازای هر پیام، حداکثر هر ۳۰ ثانیه یک بار
+SAVE_DEBOUNCE_S = 30.0
+_dirty = False
+_last_save_ts = 0.0
+_save_timer: threading.Timer | None = None
 
 # ---------- load/save ----------
 def _load():
@@ -29,28 +35,61 @@ def _load():
     os.makedirs(DATA_DIR, exist_ok=True)
     try:
         if os.path.exists(USERS_FILE):
-            _users = json.load(open(USERS_FILE))
+            with open(USERS_FILE) as f:
+                _users = json.load(f)
     except Exception:
         _users = {}
     try:
         if os.path.exists(GROUPS_FILE):
-            _groups = json.load(open(GROUPS_FILE))
+            with open(GROUPS_FILE) as f:
+                _groups = json.load(f)
     except Exception:
         _groups = {}
     try:
         if os.path.exists(DAILY_FILE):
-            _daily = json.load(open(DAILY_FILE))
+            with open(DAILY_FILE) as f:
+                _daily = json.load(f)
     except Exception:
         _daily = {}
 
 def _save():
+    """ذخیره‌ی اتمیک: اول تو فایل tmp نوشته می‌شه، بعد با os.replace جاشگزین می‌شه —
+    فایل روی دیسک همیشه معتبره (حتی اگه وسط نوشتن کرش/kill بشه) و هندل همیشه بسته می‌شه."""
+    global _last_save_ts
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
-        json.dump(_users, open(USERS_FILE, "w"))
-        json.dump(_groups, open(GROUPS_FILE, "w"))
-        json.dump(_daily, open(DAILY_FILE, "w"))
+        for path, data in ((USERS_FILE, _users), (GROUPS_FILE, _groups), (DAILY_FILE, _daily)):
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(path + ".tmp", path)
+        _last_save_ts = time.time()
     except Exception as e:
         log.warning("admin save: %s", e)
+
+def _save_debounced():
+    """اگه از آخرین ذخیره کمتر از ۳۰ ثانیه گذشته، فقط dirty می‌شه و یک Timer تک‌شلیک
+    (daemon=True — مانع shutdown نمی‌شه) ذخیره رو زمان‌بندی می‌کنه؛ وگرنه همین حالا ذخیره."""
+    global _dirty, _save_timer
+    with _lock:
+        now = time.time()
+        if now - _last_save_ts >= SAVE_DEBOUNCE_S:
+            _dirty = False
+            _save()
+            return
+        _dirty = True
+        if _save_timer is None:
+            _save_timer = threading.Timer(SAVE_DEBOUNCE_S, _flush_if_dirty)
+            _save_timer.daemon = True
+            _save_timer.start()
+
+def _flush_if_dirty():
+    """Timer رسیده — اگه چیزی ذخیره‌نشده مونده، ذخیره کن."""
+    global _dirty, _save_timer
+    with _lock:
+        _save_timer = None
+        if _dirty:
+            _dirty = False
+            _save()
 
 def _day_key(ts=None) -> str:
     ir = datetime.timezone(datetime.timedelta(hours=3, minutes=30))
@@ -86,7 +125,7 @@ def track_user(user) -> dict:
         if len(_daily) > 35:
             for k in sorted(_daily)[:-30]:
                 _daily.pop(k, None)
-        _save()
+        _save_debounced()
     return u
 
 def track_group(chat) -> None:
@@ -101,7 +140,7 @@ def track_group(chat) -> None:
         g["last"] = now
         g["count"] = g.get("count", 0) + 1
         _groups[cid] = g
-        _save()
+        _save_debounced()
 
 # ---------- آمار ----------
 def overview() -> dict:

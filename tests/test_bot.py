@@ -27,10 +27,18 @@ CASES_PARSE = [
     ("بیتکوین", "single", "BTC"),
     ("BTC", "single", "BTC"),
     ("تون", "single", "TON"),
-    ("گرم", "single", "TON"),
+    ("گرم", "single", "gold_18"),
     ("۱۲۵ دلار", "calc", ("dollar", 125.0)),
     ("2 گرم طلا", "calc", ("gold_18", 2.0)),
+    ("2 گرم", "calc", ("gold_18", 2.0)),   # گرم = گرم طلا، نه تون‌کوین
     ("۵۰ تتر", "calc", ("usdt", 50.0)),
+    ("1,000,000 یورو", "calc", ("euro", 1000000.0)),  # جداکننده هزارگان
+    ("1،000 یورو", "calc", ("euro", 1000.0)),
+    ("دلار؟", "single", "dollar"),         # علائم نگارشی مانع مچ نیستن
+    ("دلار هست؟", "single", "dollar"),
+    ("قیمت بیت کوین چنده", "single", "BTC"),  # گیت تعداد کلمه بعد از clean
+    ("قیمت طلای ۱۸ چنده", "single", "gold_18"),
+    ("hello world foo bar baz", None, None),  # ۵ کلمه‌ی واقعی → رد
     ("بازار", "market", None),
     ("بازار امروز", "market", None),
     ("market", "market", None),
@@ -80,7 +88,10 @@ CASES_FMT = [
     (0.00001234, "0.00001234"),   # کریپتو کوچک
     (1.5, "1.5"),
     ("1234", "1,234"),            # ورودی رشته‌ای
-    ("invalid", "invalid"),       # رشته‌ی غیرعددی دست‌نخورده
+    ("invalid", "invalid"),       # رشته‌ی غیرعددی دست‌خورده
+    (None, "—"),                  # مقدار ناموجود → کرش نمی‌کنه
+    (-0.00001234, "-0.00001234"), # اعداد منفی کوچک دقتشون حفظ بشه
+    (-0.5, "-0.5"),
 ]
 
 def test_fmt_num():
@@ -144,7 +155,7 @@ def test_catalog_asset_urls():
 # ---------------- datafeeds (بدون شبکه) ----------------
 
 def test_cache_ttl():
-    """_cached باید TTL رو رعایت کنه — کش ۳ ثانیه."""
+    """_cached باید TTL رو رعایت کنه — بدون sleep واقعی؛ timestamp دستی عوض می‌شه."""
     import time
     import datafeeds
     calls = []
@@ -155,8 +166,10 @@ def test_cache_ttl():
     datafeeds._cached("test_key", fn)
     datafeeds._cached("test_key", fn)  # باید کش بشه
     n1 = len(calls)
-    time.sleep(3.2)  # از TTL رد می‌شه
-    datafeeds._cached("test_key", fn)
+    # انقضای TTL رو با عقب بردن timestamp شبیه‌سازی کن — بدون sleep
+    ts, val = datafeeds._cache["test_key"]
+    datafeeds._cache["test_key"] = (ts - (datafeeds.CACHE_TTL + 1), val)
+    datafeeds._cached("test_key", fn)  # باید دوباره صدا زده بشه
     n2 = len(calls)
     ok = (n1 == 1) and (n2 == 2)
     print(f"  cache_ttl: {'OK' if ok else 'FAIL'} (calls before={n1} after-ttl={n2})")
@@ -180,24 +193,37 @@ def test_admin_day_key():
 
 
 def test_admin_track_user():
-    """ثبت کاربر باید شمارنده رو بالا ببره."""
+    """ثبت کاربر باید شمارنده رو بالا ببره — بدون آلوده کردن hist/_stats_*.json واقعی."""
     import admin
-    admin._users.clear()
-    admin._daily.clear()
+    import shutil
+    import tempfile
+    # مسیرهای ذخیره‌سازی ادمین موقتاً به یه دایرکتوری tmp ریدایرکت بشن
+    tmp_dir = tempfile.mkdtemp(prefix="aurora_test_stats_")
+    saved = (admin.USERS_FILE, admin.GROUPS_FILE, admin.DAILY_FILE, admin.DATA_DIR)
+    admin.USERS_FILE = os.path.join(tmp_dir, "_stats_users.json")
+    admin.GROUPS_FILE = os.path.join(tmp_dir, "_stats_groups.json")
+    admin.DAILY_FILE = os.path.join(tmp_dir, "_stats_daily.json")
+    admin.DATA_DIR = tmp_dir
+    try:
+        admin._users.clear()
+        admin._daily.clear()
 
-    class FakeUser:
-        id = 999999999
-        is_bot = False
-        first_name = "Test"
-        last_name = None
-        username = "tester"
+        class FakeUser:
+            id = 999999999
+            is_bot = False
+            first_name = "Test"
+            last_name = None
+            username = "tester"
 
-    admin.track_user(FakeUser())
-    admin.track_user(FakeUser())
-    ok = admin._users.get("999999999", {}).get("count") == 2
-    print(f"  admin_track_user: {'OK' if ok else 'FAIL'}")
-    admin._users.clear()
-    admin._daily.clear()
+        admin.track_user(FakeUser())
+        admin.track_user(FakeUser())
+        ok = admin._users.get("999999999", {}).get("count") == 2
+        print(f"  admin_track_user: {'OK' if ok else 'FAIL'}")
+        admin._users.clear()
+        admin._daily.clear()
+    finally:
+        admin.USERS_FILE, admin.GROUPS_FILE, admin.DAILY_FILE, admin.DATA_DIR = saved
+        shutil.rmtree(tmp_dir, ignore_errors=True)
     return ok
 
 

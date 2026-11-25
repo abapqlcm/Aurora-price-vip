@@ -11,12 +11,15 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import requests
 import imageio_ffmpeg
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageChops
+import arabic_reshaper
+from bidi.algorithm import get_display
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageChops, features
 
 import catalog
 import datafeeds
@@ -87,26 +90,44 @@ def _font(size: int, weight: str = "m") -> ImageFont.FreeTypeFont:
     return _FONTS[key]
 
 
+_BG_FAIL_CACHE: dict = {}  # url → timestamp آخرین خطای دانلود (کش منفی ۳۰۰ ثانیه‌ای)
+_BG_OK_CACHE: dict = {}    # url → تصویر موفق (بخوانی دوم در همون رندر بدون درخواست/دیسک)
+_BG_FAIL_TTL = 300
+
+
 def _fetch_bg_image(code: str) -> Optional[Image.Image]:
-    """پرچم یا لوگوی رمزارز — با کش در assets/."""
+    """پرچم یا لوگوی رمزارز — با کش در assets/ + کش منفی خطاها (TTL ۳۰۰s)."""
     url, kind, key = catalog.asset_urls(code)
     if not url:
         return None
+    now = time.time()
+    fail_ts = _BG_FAIL_CACHE.get(url)
+    if fail_ts is not None:
+        if now - fail_ts < _BG_FAIL_TTL:
+            return None  # URL خراب — تا ۵ دقیقه دوباره تلاش نشه
+        _BG_FAIL_CACHE.pop(url, None)
+    hit = _BG_OK_CACHE.get(url)
+    if hit is not None:
+        return hit.copy()
     os.makedirs("assets", exist_ok=True)
     path = f"assets/{key}.png"
     if not os.path.exists(path):
         try:
-            r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            r = requests.get(url, timeout=6, headers={"User-Agent": "Mozilla/5.0"})
             r.raise_for_status()
             open(path, "wb").write(r.content)
         except Exception as e:
             log.warning("bg fetch %s: %s", url, e)
+            _BG_FAIL_CACHE[url] = now
             return None
     try:
-        return Image.open(path).convert("RGB")
+        img = Image.open(path).convert("RGB")
     except Exception as e:
         log.warning("bg open %s: %s", path, e)
+        _BG_FAIL_CACHE[url] = now
         return None
+    _BG_OK_CACHE[url] = img
+    return img.copy()
 
 
 def _blurred_bg(img: Image.Image, color_type: str = "fiat") -> Image.Image:
@@ -279,7 +300,7 @@ def render_fa_num(v) -> str:
 _VIDEO_LOCK = threading.Lock()
 _TON_BG_CACHE: dict = {}
 _VIDEO_BASE_CACHE: dict = {}  # بک‌گراند ویدیو (no_chart) — کلید: (code, price, pct)  # بک‌گراند تون static — یک بار ساخته شه
-_MP4_CACHE: dict = {}
+_MP4_CACHE: OrderedDict = OrderedDict()
 # ۲۵. قیمت لحظه‌ی رندر هر ویدیو — برای مچ‌کردن کپشن با بنر (بدون مغایرت)
 _LAST_VIDEO_PRICE: dict = {}
 
@@ -315,6 +336,7 @@ def render_banner_video(code: str, duration: float = 2.0, fps: int = 16) -> Opti
                 log.warning("video render returned None %s (hist=%s)", code, len((data or {}).get("history") or []))
             if out and data:
                 _LAST_VIDEO_PRICE[ck] = data.get("price")
+                _cache_cap(_LAST_VIDEO_PRICE)
             return out
         except Exception as e:
             log.warning("video render %s: %s", code, e)
@@ -327,17 +349,19 @@ def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps:
     if not data or not data.get("price"):
         return None
     hist = data.get("history") or []
-    # فالبک تاریخچه: TGJU گاهی 500 می‌ده → اول کندل‌های واقعی والکس، بعد snapshotهای محلی
+    # فالبک تاریخچه: TGJU گاهی 500 می‌ده → برای usdt/dollar اول کندل‌های والکس،
+    # برای بقیه‌ی ارزها تاریخچه‌ی محلی خودشان (تاریخچه‌ی تتر برای دلار/تتر فقط)
     if len(hist) < 4:
-        wh = datafeeds.wallex_history("USDTTMN", 24)
-        if len(wh) >= 4:
-            hist = wh
-        else:
-            lh = local_history(ck)
+        if ck in ("usdt", "dollar"):
+            wh = datafeeds.wallex_history("USDTTMN", 24)
+            if len(wh) >= 4:
+                hist = wh
+        if len(hist) < 2:
+            lh = datafeeds.local_history(ck)
             if len(lh) >= 2:
                 hist = [p for _, p in lh]
-            else:
-                hist = [data["price"] * 0.999, data["price"]]
+        if len(hist) < 2:
+            hist = [data["price"] * 0.999, data["price"]]
     if len(hist) < 2:
         return None
 
@@ -452,9 +476,9 @@ def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps:
                     log.warning("neon border frame: %s", e_nb)
                 # ۰) بج LIVE چشمک‌زن — دوره‌ی ۲.۴s نرم (بجای ۱s تند)
                 _draw_live_badge(d, badge_x, badge_y, pulse_t=(f / (fps * 2.4)) % 1.0)
-                # ذرات نورانی (برگشت — کاربر خواست بمونه)
+                # ذرات نورانی (برگشت — کاربر خواست بمونه) — seed per-frame تا ذرات حرکت کنن
                 try:
-                    _draw_particles(d, w, h, t, accent_color, seed=42)
+                    _draw_particles(d, w, h, t, accent_color, seed=42 + f)
                 except Exception as e_p:
                     log.warning("particles frame: %s", e_p)
                 # ۱۰. پالس لوگو — هاله‌ی دایره‌ای دور لوگوی گوشه (موج نرم + محو)
@@ -526,6 +550,7 @@ def _render_video_uncached(code: str, ck: str, now: float, duration: float, fps:
         log.warning("video output empty %s: %d bytes", code, len(out) if out else 0)
         return None
     _MP4_CACHE[ck] = (now, out)
+    _cache_cap(_MP4_CACHE)
     return out
 
 
@@ -545,7 +570,7 @@ def _code_ids(code: str):
     return None, None
 
 
-_PNG_CACHE: dict = {}
+_PNG_CACHE: OrderedDict = OrderedDict()
 _RENDER_LOCK = threading.Lock()  # ۱۳. رندر هم‌زمان دوتا thread برای یه ارز → lock
 
 def _asset_type(code: str) -> str:
@@ -562,8 +587,14 @@ def _asset_type(code: str) -> str:
     return "fiat"
 
 
+_GOLD_LOGO_CACHE: dict = {}  # size → تصویر شمش (کپی برگردونده می‌شه تا تماس‌ها کش رو خراب نکنن)
+
+
 def _gold_ingot_logo(size: int = 84) -> Optional[Image.Image]:
     """لوگوی شمش طلای سه‌بعدی با گرادیان — برای کادر آیکون طلا/سکه."""
+    hit = _GOLD_LOGO_CACHE.get(size)
+    if hit is not None:
+        return hit.copy()
     s4 = size * 4  # supersample برای لبه‌های نرم
     img = Image.new("RGBA", (s4, s4), (0, 0, 0, 0))
 
@@ -614,7 +645,10 @@ def _gold_ingot_logo(size: int = 84) -> Optional[Image.Image]:
     glow = glow.filter(ImageFilter.GaussianBlur(s4 / 22))
     img = Image.alpha_composite(glow, img)
 
-    return img.resize((size, size), Image.LANCZOS)
+    out = img.resize((size, size), Image.LANCZOS)
+    _cache_cap(_GOLD_LOGO_CACHE)
+    _GOLD_LOGO_CACHE[size] = out.copy()
+    return out.copy()
 
 
 def _gold_lux_bg() -> Image.Image:
@@ -790,7 +824,9 @@ def _draw_neon_border(card, cw, ch, t: float, accent):
 
 
 def _draw_particles(cd, w, h, t: float, accent, seed=1):
-    """ایده ۶: ذرات نورانی شناور (بالا می‌رن). t∈[0,1) فاز کلی."""
+    """ایده ۶: ذرات نورانی شناور (بالا می‌رن). t∈[0,1) فاز کلی.
+    seed پیش‌فرض per-frame (فریم فایل ویدیو) پاس داده می‌شه → هر فریم چیدمان خودش رو
+    داره و ذرات بین فریم‌ها واقعاً جابه‌جا دیده می‌شن (فقط فرمول حرکت عوض نشده)."""
     rnd = random.Random(seed)
     for _ in range(14):
         px = rnd.randint(20, w - 20)
@@ -841,12 +877,20 @@ def _draw_surge_badge(cd, x, y, accent):
 
 def _rollup_digits(img, cx, cy, target, t, unit=""):
     """ایده ۲: انیمیشن roll-up عدد قیمت (فقط ویدیو). t∈[0,1) پیشرفت.
-    قیمت بزرگ → صحیح (بدون اعشار). قیمت کوچک <۲۰ (مثل TON 1.31) → دو رقم اعشار
-    وگرنه کل ویدیو فقط «0/1» نشون می‌ده و قیمت واقعی هیچ‌وقت دیده نمی‌شه."""
+    قرارداد دقت دقیقاً مثل _fmt (بر اساس target تا فرمت وسط انیمیشن نپره):
+    <0.01 → ~۸ رقم اعشار، <10 → ۶ رقم، بقیه → ۲ رقم — فریم آخر == _fmt(price)."""
     eased = 1 - (1 - t) ** 3
     cur = target * eased
-    if target < 20:
-        txt = f"{cur:,.2f}"
+    if isinstance(target, float) and target < 0.01 and target > 0:
+        txt = f"{cur:,.10f}".rstrip("0").rstrip(".")
+        if len(txt.split(".")[-1]) < 8 and "." in txt:
+            txt = f"{cur:,.8f}".rstrip("0")
+            if txt.endswith("."):
+                txt = txt[:-1]
+    elif isinstance(target, float) and target < 10:
+        txt = f"{cur:,.6f}".rstrip("0").rstrip(".")
+    elif isinstance(target, float):
+        txt = f"{cur:,.2f}".rstrip("0").rstrip(".")
     else:
         txt = f"{int(round(cur)):,}"
     if unit == "دلار":
@@ -868,6 +912,12 @@ def _draw_live_badge(cd, x, y, pulse_t: float = 0.0):
     lv = blink if pulse_t > 0 else 1.0
     cd.text((x + 14, y), "LIVE", font=f_b,
             fill=(int(46 * lv), int(204 * lv), int(113 * lv)), anchor="lm")
+
+
+def _cache_cap(d: dict, max_entries: int = 24):
+    """سقف حافظه‌ی کش‌ها — قدیمی‌ترین ورودیِ درج‌شده حذف می‌شه (ترتیب درج dict)."""
+    while len(d) > max_entries:
+        d.pop(next(iter(d)))
 
 
 def render_market_card() -> Optional[bytes]:
@@ -969,6 +1019,7 @@ def render_market_card() -> Optional[bytes]:
         buf = io.BytesIO()
         img.save(buf, "PNG")
         _PNG_CACHE["__market__"] = (now, buf.getvalue())
+        _cache_cap(_PNG_CACHE)
         return _PNG_CACHE["__market__"][1]
 
 
@@ -1019,13 +1070,12 @@ def _render_banner_uncached(code: str, ck: str, now: float, no_chart: bool = Fal
     price = data["price"]
     pct = data.get("change_pct")
     if not data.get("updated"):
-        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
-        ir = _tz(_td(hours=3, minutes=30))
-        data["updated"] = _dt.now(ir).strftime("%H:%M:%S")
+        ir = timezone(timedelta(hours=3, minutes=30))
+        data["updated"] = datetime.now(ir).strftime("%H:%M:%S")
     hist = data.get("history") or []
     # ارزهای er-api تاریخچه ندارن → خط تخت زنده بساز (از snapshotهای ربات)
     if len(hist) < 2 and price:
-        lh = local_history(code)
+        lh = datafeeds.local_history(ck)
         if len(lh) >= 2:
             hist = [p for _, p in lh]
         else:
@@ -1301,4 +1351,5 @@ def _render_banner_uncached(code: str, ck: str, now: float, no_chart: bool = Fal
         # بنر ویدیویی کش نمی‌شه (موقته) — فقط برگرد
         return buf.getvalue()
     _PNG_CACHE[ck] = (now, buf.getvalue())
+    _cache_cap(_PNG_CACHE)
     return _PNG_CACHE[ck][1]

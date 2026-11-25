@@ -6,3 +6,5 @@ __pycache__/
 .DS_Store
 # استثنا: بنرهای دموی README
 !docs/screenshots/*.png
+# دیتای ران‌تایم ربات (قیمت‌ها/آمار) نباید تو گیت باشه
+hist/
