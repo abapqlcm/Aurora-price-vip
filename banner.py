@@ -311,7 +311,7 @@ def get_last_video_price(code: str):
     return _LAST_VIDEO_PRICE.get(ck)
 
 
-def render_banner_video(code: str, duration: float = 2.0, fps: int = 24) -> Optional[bytes]:
+def render_banner_video(code: str, duration: float = 1.5, fps: int = 24) -> Optional[bytes]:
     """۵. نمودار متحرک MP4 — خط با انیمیشن کشیده می‌شه + نقطه‌ی pulse.
     خروجی bytes (mp4/h264). کش ۶۰ ثانیه. fallback: None → فراخوان از PNG استفاده کنه."""
     ck = catalog.resolve(code) or code
