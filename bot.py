@@ -657,16 +657,6 @@ async def _admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query, data:
         await query.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
 
     elif data == "adm_groups":
-        gs = admin.groups_list()
-        lines = [f"👨‍👩‍👧‍👦 <b>گروه‌ها ({len(gs)}):</b>\n"]
-        for cid, g in gs[:15]:
-            lines.append(f"• <b>{g.get('title') or 'بی‌نام'}</b> — {g.get('count', 0)} پیام")
-        if not gs:
-            lines.append("هنوز گروهی ثبت نشده.")
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ برگشت", callback_data="adm_main")]])
-        await query.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
-
-    elif data == "adm_groups":
         # ورودی دکمه‌ی اصلی پنل → همون لیست صفحه‌بندی‌شده (صفحه‌ی ۰)
         await _admin_cb(update, ctx, query, "adm_grpp:0")
 
