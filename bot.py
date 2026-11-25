@@ -691,7 +691,10 @@ async def _admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query, data:
         rows = []
         # دکمه‌ی 👁 برای هر گروه → جزئیات
         for cid, _g in chunk:
-            rows.append([InlineKeyboardButton("👁", callback_data=f"adm_grp:{cid}")])
+            _t = str(_g.get("title") or "بی‌نام").strip()
+            if len(_t) > 26:
+                _t = _t[:25] + "…"
+            rows.append([InlineKeyboardButton(f"👁 {_t}", callback_data=f"adm_grp:{cid}")])
         if nav:
             rows.append(nav)
         rows.append([InlineKeyboardButton("◀️ برگشت", callback_data="adm_main")])
@@ -769,6 +772,8 @@ async def _admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE, query, data:
             return
         with _BC_TARGETS_LOCK:
             _BC_TARGETS[admin.OWNER_ID] = [cid]
+        with _BC_STATE_LOCK:
+            _BC_STATE[admin.OWNER_ID] = True
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ انصراف", callback_data="adm_cancel_bc")]])
         await query.edit_message_text(
             "📢 <b>پیام به این گروه</b>\n\nمتن پیام رو بفرست (همون پیام به این گروه می‌ره).\n"
