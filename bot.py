@@ -121,15 +121,16 @@ async def _prefetch(ctx: ContextTypes.DEFAULT_TYPE, keys: list):
 
 
 # اولویت با پرتقاضاتره — warm loop زودتر نرم میکنه
-HOT_KEYS = ["dollar", "usdt", "euro", "BTC", "gold_18", "pound", "TON", "try", "aed", "SOL", "ETH",
-            "coin_emami", "coin_gerami", "gold_24", "kwd", "chf", "XRP", "DOGE", "SHIB", "BNB"]
+# سبک‌شده ۲۰۲۶-۱۱-۲۶: فقط ۸ ارز داغ (به‌جای ۲۰) تا CPU سرور ۲کوره اشباع نشه
+HOT_KEYS = ["dollar", "usdt", "euro", "BTC", "gold_18", "pound", "TON", "try"]
 
 
 async def _warm_loop(ctx: ContextTypes.DEFAULT_TYPE):
-    """هر ۴ ثانیه ۳ ارز محبوب رو موازی رندر می‌کنه — دوره کامل ۱۵s بجای ۴۴s.
+    """هر ۱۰ ثانیه ۲ ارز محبوب رو موازی رندر می‌کنه — دوره کامل ۴۰s.
+    با TTL ۶۰s ویدیو، هر کلید هر ~۴۰s تازه می‌شه — همیشه کش گرم.
     بدون فشار به APIها (datafeeds خودش کش ۳s داره)."""
     idx = 0
-    batch_size = 4  # با TTL ۲۵s هر کلید هر ~11s تازه می‌شه — همیشه کش گرم
+    batch_size = 2  # سبک‌شده: ۲ تا در هر دور به‌جای ۴ تا
     while True:
         try:
             batch = [HOT_KEYS[(idx + i) % len(HOT_KEYS)] for i in range(batch_size)]
@@ -147,7 +148,7 @@ async def _warm_loop(ctx: ContextTypes.DEFAULT_TYPE):
             await asyncio.get_running_loop().run_in_executor(None, _job, batch)
         except Exception as e:
             log.warning("warm loop: %s", e)
-        await asyncio.sleep(4)
+        await asyncio.sleep(10)
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
